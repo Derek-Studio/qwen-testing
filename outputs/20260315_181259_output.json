@@ -1,0 +1,22 @@
+[
+  {
+    "description": "Open Mic Night",
+    "dates": "Every Monday at 7pm"
+  },
+  {
+    "description": "Games Night",
+    "dates": "Every Thursday at 7.30pm"
+  },
+  {
+    "description": "Quiz Night",
+    "dates": "Every [Day] at £2pp"
+  },
+  {
+    "description": "DJ Night",
+    "dates": "Every Saturday at 8.30pm"
+  },
+  {
+    "description": "Karaoke Night",
+    "dates": "Every Sunday at 7.30pm"
+  }
+]

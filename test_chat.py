@@ -10,7 +10,7 @@ Type 'quit' or press Ctrl-C to exit.
 import subprocess
 import sys
 
-MODEL = "qwen3:0.6b"
+MODEL = "qwen3:1.7b"
 
 
 def run_prompt(prompt: str) -> str:

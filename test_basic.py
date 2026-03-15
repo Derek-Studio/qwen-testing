@@ -7,7 +7,7 @@ Uses subprocess to call `ollama run` — no server or network needed.
 import subprocess
 import sys
 
-MODEL = "qwen3:0.6b"
+MODEL = "qwen3:1.7b"
 
 PROMPTS = [
     "What is 2 + 2? Answer in one sentence.",

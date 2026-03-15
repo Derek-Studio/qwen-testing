@@ -11,7 +11,7 @@ import sys
 import urllib.request
 from urllib.error import URLError
 
-MODEL = "qwen3:0.6b"
+MODEL = "qwen3:1.7b"
 BASE_URL = "http://localhost:11434"
 
 
