@@ -1,0 +1,22 @@
+[
+  {
+    "name": "The Windmill Clapham",
+    "query": "what promotions and deals are on at The Windmill pub Clapham Common"
+  },
+  {
+    "name": "The Exhibit Balham",
+    "query": "what promotions happy hours and events are on at The Exhibit bar Balham"
+  },
+  {
+    "name": "The Effra Social Brixton",
+    "query": "what promotions deals and events are on at Effra Social pub Brixton"
+  },
+  {
+    "name": "The Macbeth Hoxton",
+    "query": "what promotions happy hours and events are on at The Macbeth pub Hoxton"
+  },
+  {
+    "name": "The Porterhouse Covent Garden",
+    "query": "what promotions deals and events are on at The Porterhouse pub Covent Garden"
+  }
+]

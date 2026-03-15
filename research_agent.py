@@ -22,7 +22,6 @@ from datetime import datetime, timezone
 from urllib.error import URLError
 
 from ddgs import DDGS
-from playwright.sync_api import sync_playwright
 
 try:
     import jsonschema
@@ -51,6 +50,41 @@ OLLAMA_TIMEOUT = 180
 MAX_RESULTS_FOR_SELECTION = 6
 NETWORKIDLE_TIMEOUT = 5000   # ms; raise to 15000 for production
 SCROLL_DELAY = 500           # ms; raise to 1500 for production
+
+
+def _extract_text(html: str) -> str:
+    """Strip noise tags and return clean text from HTML using BeautifulSoup."""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+        tag.decompose()
+    main = next(
+        (t for t in (soup.find("main"), soup.find("article"), soup.find("body"), soup)
+         if t and t.get_text(strip=True)),
+        soup,
+    )
+    return "\n".join(l for l in main.get_text("\n", strip=True).splitlines() if l)
+
+
+def _extract_links(page, base_url: str) -> list[dict]:
+    """Extract absolute links from a Playwright page."""
+    raw_links = page.eval_on_selector_all(
+        "a[href]",
+        "els => els.map(e => ({text: e.innerText.trim(), href: e.getAttribute('href')}))"
+    )
+    links = []
+    seen = set()
+    for link in raw_links:
+        href = link.get("href", "")
+        if not href or href.startswith("#") or href.startswith("javascript:"):
+            continue
+        abs_url = urllib.parse.urljoin(base_url, href)
+        if abs_url not in seen:
+            seen.add(abs_url)
+            links.append({"text": link.get("text", "")[:80], "url": abs_url})
+        if len(links) >= MAX_LINKS_TO_SHOW:
+            break
+    return links
 
 
 def _coerce_to_schema(raw):
@@ -234,60 +268,191 @@ def make_search_tool(provider: str) -> BraveSearchTool | DDGSearchTool:
 
 
 class BrowserTool:
-    def fetch_page(self, url: str) -> dict:
-        browser = None
+    """Persistent Playwright browser session. Use as a context manager or call start()/close()."""
+
+    _USER_AGENT = (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+
+    def __init__(self):
+        self._pw = self._browser = self._context = None
+
+    def start(self):
+        from playwright.sync_api import sync_playwright
+        self._pw = sync_playwright().start()
+        self._browser = self._pw.chromium.launch(headless=True)
+        self._context = self._browser.new_context(
+            user_agent=self._USER_AGENT,
+            viewport={"width": 1280, "height": 900},
+        )
+
+    def close(self):
+        if self._browser:
+            try:
+                self._browser.close()
+            except Exception:
+                pass
+        if self._pw:
+            try:
+                self._pw.stop()
+            except Exception:
+                pass
+        self._pw = self._browser = self._context = None
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def _try_http_fetch(self, url: str) -> str | None:
+        """Fast HTTP fetch via requests. Returns extracted text or None on failure."""
         try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                page = browser.new_page(
-                    user_agent=(
-                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                    ),
-                    viewport={"width": 1280, "height": 900},
-                )
-                page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                text = page.inner_text("body")
+            import requests
+            r = requests.get(
+                url,
+                headers={"User-Agent": self._USER_AGENT},
+                timeout=8,
+            )
+            r.raise_for_status()
+            return _extract_text(r.text)
+        except Exception:
+            return None
 
-                try:
-                    page.wait_for_load_state("networkidle", timeout=NETWORKIDLE_TIMEOUT)
-                except Exception:
-                    pass  # fall through silently on timeout
+    def fetch_page(self, url: str) -> dict:
+        # 1. Try fast HTTP fetch first
+        text = self._try_http_fetch(url)
+        if text and len(text) >= 500:
+            return {"url": url, "text": text[:MAX_PAGE_CHARS], "links": []}
 
-                # Scroll to trigger lazy-loaded content
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                page.wait_for_timeout(SCROLL_DELAY)
-
-                text_after = page.inner_text("body")
-                text = text_after if len(text_after) > len(text) else text
-                text = text[:MAX_PAGE_CHARS]
-
-                raw_links = page.eval_on_selector_all(
-                    "a[href]",
-                    "els => els.map(e => ({text: e.innerText.trim(), href: e.getAttribute('href')}))"
-                )
-                links = []
-                seen = set()
-                for link in raw_links:
-                    href = link.get("href", "")
-                    if not href or href.startswith("#") or href.startswith("javascript:"):
-                        continue
-                    abs_url = urllib.parse.urljoin(url, href)
-                    if abs_url not in seen:
-                        seen.add(abs_url)
-                        links.append({"text": link.get("text", "")[:80], "url": abs_url})
-                    if len(links) >= MAX_LINKS_TO_SHOW:
-                        break
-
-                browser.close()
-                return {"url": url, "text": text, "links": links}
+        # 2. Fall back to Playwright
+        if self._context is None:
+            # Support calling without explicit start() for backwards compatibility
+            self.start()
+        page = self._context.new_page()
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=NETWORKIDLE_TIMEOUT)
+            except Exception:
+                pass
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(SCROLL_DELAY)
+            html = page.content()
+            text = _extract_text(html)
+            links = _extract_links(page, url)
+            return {"url": url, "text": text[:MAX_PAGE_CHARS], "links": links}
         except Exception as e:
-            if browser:
-                try:
-                    browser.close()
-                except Exception:
-                    pass
             return {"url": url, "text": f"Error fetching page: {e}", "links": []}
+        finally:
+            page.close()
+
+
+def debug_fetch(url: str) -> None:
+    import os, time
+    from urllib.parse import urlparse
+    domain = urlparse(url).netloc
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    outdir = f"outputs/debug_{ts}_{domain}"
+    os.makedirs(outdir, exist_ok=True)
+
+    # --- HTTP fetch ---
+    http_html = ""
+    try:
+        import requests
+        r = requests.get(url, headers={"User-Agent": BrowserTool._USER_AGENT}, timeout=8)
+        r.raise_for_status()
+        http_html = r.text
+    except Exception as e:
+        print(f"[debug] HTTP fetch failed: {e}")
+    http_text = _extract_text(http_html) if http_html else ""
+    print(f"[debug] HTTP raw HTML:        {len(http_html):,} chars")
+    print(f"[debug] HTTP extracted text:  {len(http_text):,} chars")
+    with open(f"{outdir}/http_raw.html", "w", encoding="utf-8") as f:
+        f.write(http_html)
+    with open(f"{outdir}/http_extracted.txt", "w", encoding="utf-8") as f:
+        f.write(http_text)
+
+    # --- Playwright fetch ---
+    pw_html = ""
+    pw_text = ""
+    browser = BrowserTool()
+    browser.start()
+    try:
+        page = browser._context.new_page()
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=NETWORKIDLE_TIMEOUT)
+            except Exception:
+                pass
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(SCROLL_DELAY)
+            pw_html = page.content()
+            pw_text = _extract_text(pw_html)
+        finally:
+            page.close()
+    finally:
+        browser.close()
+    print(f"[debug] Playwright raw HTML:  {len(pw_html):,} chars")
+    print(f"[debug] Playwright extracted: {len(pw_text):,} chars")
+    with open(f"{outdir}/playwright_raw.html", "w", encoding="utf-8") as f:
+        f.write(pw_html)
+    with open(f"{outdir}/playwright_extracted.txt", "w", encoding="utf-8") as f:
+        f.write(pw_text)
+
+    print(f"\nSaved to: {outdir}/")
+
+
+def _batch_worker(args: tuple) -> dict:
+    """Top-level worker for ProcessPoolExecutor — must be picklable (no closures)."""
+    pub, provider, search_provider, schema = args
+    name = pub.get("name", pub.get("url", "unknown"))
+    query = pub.get("query") or f"what promotions are taking place at {name}"
+    url = pub.get("url") or None
+    print(f"[{name}] starting", flush=True)
+    try:
+        llm = make_llm_client(provider)
+        search = make_search_tool(search_provider)
+        agent = ResearchAgent(llm=llm, search=search, browser=BrowserTool(), schema=schema)
+        result = agent.run(query, start_url=url)
+        print(f"[{name}] done", flush=True)
+        return {"pub": name, "query": query, "result": result, "error": None}
+    except Exception as e:
+        print(f"[{name}] ERROR: {e}", flush=True)
+        return {"pub": name, "query": query, "result": None, "error": str(e)}
+
+
+def run_batch(batch_file: str, provider: str, search_provider: str, schema, workers: int) -> None:
+    import time
+    from concurrent.futures import ProcessPoolExecutor
+    with open(batch_file) as f:
+        pubs = json.load(f)
+
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    os.makedirs("outputs", exist_ok=True)
+    outfile = f"outputs/batch_{ts}.json"
+
+    print(f"Batch   : {len(pubs)} pubs, {workers} workers")
+    print(f"Provider: {provider}  Search: {search_provider}")
+    print(f"Output  : {outfile}")
+    print("=" * 60)
+
+    results = []
+    worker_args = [(pub, provider, search_provider, schema) for pub in pubs]
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(_batch_worker, a) for a in worker_args]
+        for future in as_completed(futures):
+            r = future.result()
+            results.append(r)
+            # Write incrementally so partial results aren't lost on crash
+            with open(outfile, "w", encoding="utf-8") as f:
+                json.dump(results, f, indent=2, ensure_ascii=False)
+
+    print("=" * 60)
+    print(f"Saved {len(results)} results to {outfile}")
 
 
 class ResearchAgent:
@@ -324,7 +489,13 @@ class ResearchAgent:
 
     def run(self, query: str, start_url: str | None = None) -> str:
         gathered_info: list[str] = []
+        self.browser.start()
+        try:
+            return self._run(query, start_url, gathered_info)
+        finally:
+            self.browser.close()
 
+    def _run(self, query: str, start_url: str | None, gathered_info: list[str]) -> str:
         # Optional: skip search and start directly from a known URL
         if start_url:
             print(f"[SKIP SEARCH] Using provided start URL: {start_url}")
@@ -452,20 +623,19 @@ class ResearchAgent:
                 browse_indices.append(i)
         browse_indices = browse_indices[:3]
 
-        # Step 4: Browse top URLs in parallel
-        print(f"[4/8] Browsing top {len(browse_indices)} result(s) in parallel...")
+        # Step 4: Browse top URLs
+        print(f"[4/8] Browsing top {len(browse_indices)} result(s)...")
         urls_to_browse = [selection_pool[bidx]["url"] for bidx in browse_indices]
         for url in urls_to_browse:
             print(f"      - {url}")
 
+        # Sequential: sync_playwright is not thread-safe (greenlet-bound)
         fetched_pages: dict[str, dict] = {}
-        with ThreadPoolExecutor(max_workers=len(urls_to_browse)) as executor:
-            future_to_url = {executor.submit(self.browser.fetch_page, url): url for url in urls_to_browse}
-            for future in as_completed(future_to_url):
-                pd = future.result()
-                fetched_pages[pd["url"]] = pd
+        for url in urls_to_browse:
+            pd = self.browser.fetch_page(url)
+            fetched_pages[pd["url"]] = pd
 
-        # Extract relevant content sequentially (Ollama is single-threaded)
+        # Extract relevant content
         page_data = None
         for url in urls_to_browse:
             pd = fetched_pages.get(url, {"url": url, "text": "", "links": []})
@@ -610,15 +780,19 @@ def main():
                         help="LLM provider: 'minimax' (default), 'claude' (Haiku), 'ollama' (local Qwen)")
     parser.add_argument("--search-provider", default="brave", choices=["brave", "ddg"],
                         help="Search provider: 'brave' (default, requires BRAVE_SEARCH_API_KEY) or 'ddg' (DuckDuckGo)")
+    parser.add_argument("--debug-url", default=None,
+                        help="Fetch URL and save all intermediate content for debugging")
+    parser.add_argument("--batch-file", default=None,
+                        help="JSON file with list of {name, url?, query?} objects to research in parallel")
+    parser.add_argument("--workers", type=int, default=5,
+                        help="Number of parallel workers for --batch-file (default: 5)")
     args = parser.parse_args()
 
-    if args.query:
-        query = args.query
-    else:
-        print(f"Research query [{DEFAULT_QUERY}]: ", end="", flush=True)
-        user_input = input().strip()
-        query = user_input if user_input else DEFAULT_QUERY
+    if args.debug_url:
+        debug_fetch(args.debug_url)
+        sys.exit(0)
 
+    # Parse schema (needed for both batch and single modes)
     schema = None
     if args.schema:
         if os.path.isfile(args.schema):
@@ -630,6 +804,17 @@ def main():
             except json.JSONDecodeError as e:
                 print(f"Error: --schema is not a valid file or JSON: {e}", file=sys.stderr)
                 sys.exit(1)
+
+    if args.batch_file:
+        run_batch(args.batch_file, args.provider, args.search_provider, schema, args.workers)
+        sys.exit(0)
+
+    if args.query:
+        query = args.query
+    else:
+        print(f"Research query [{DEFAULT_QUERY}]: ", end="", flush=True)
+        user_input = input().strip()
+        query = user_input if user_input else DEFAULT_QUERY
 
     llm = make_llm_client(args.provider)
     search = make_search_tool(args.search_provider)
