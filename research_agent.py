@@ -38,6 +38,8 @@ except ImportError:
 
 OLLAMA_MODEL = "qwen3:1.7b"
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
+MINIMAX_MODEL = "MiniMax-Text-01"
+MINIMAX_API_URL = "https://api.minimaxi.chat/v1/chat/completions"
 BASE_URL = "http://localhost:11434"
 MAX_SEARCH_RESULTS = 5
 MAX_BROWSE_ITERATIONS = 1
@@ -110,12 +112,49 @@ class ClaudeClient:
         return message.content[0].text.strip()
 
 
-def make_llm_client(provider: str) -> OllamaClient | ClaudeClient:
-    if provider == "claude":
+class MiniMaxClient:
+    """MiniMax API — OpenAI-compatible. Requires MINIMAX_API_KEY."""
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    def is_available(self) -> bool:
+        return True
+
+    def chat(self, system: str, user: str) -> str:
+        payload = json.dumps({
+            "model": MINIMAX_MODEL,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "max_tokens": 1024,
+        }).encode()
+        req = urllib.request.Request(
+            MINIMAX_API_URL,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode())
+        return data["choices"][0]["message"]["content"].strip()
+
+
+def make_llm_client(provider: str) -> OllamaClient | ClaudeClient | MiniMaxClient:
+    if provider == "minimax":
+        api_key = os.environ.get("MINIMAX_API_KEY", "")
+        if not api_key:
+            print("Error: MINIMAX_API_KEY environment variable not set.", file=sys.stderr)
+            sys.exit(1)
+        return MiniMaxClient(api_key=api_key)
+    elif provider == "claude":
         api_key = os.environ.get("ANTHROPIC_API_KEY", "")
         if not api_key:
             print("Error: ANTHROPIC_API_KEY environment variable not set.", file=sys.stderr)
-            print("Export it before running: export ANTHROPIC_API_KEY=sk-ant-...", file=sys.stderr)
             sys.exit(1)
         return ClaudeClient(api_key=api_key)
     else:
@@ -567,8 +606,8 @@ def main():
                         help="JSON schema as inline string or path to .json file")
     parser.add_argument("--start-url", default=None,
                         help="Skip search and start browsing from this URL directly")
-    parser.add_argument("--provider", default="ollama", choices=["ollama", "claude"],
-                        help="LLM provider: 'ollama' (local Qwen, default) or 'claude' (Haiku via API)")
+    parser.add_argument("--provider", default="minimax", choices=["minimax", "claude", "ollama"],
+                        help="LLM provider: 'minimax' (default), 'claude' (Haiku), 'ollama' (local Qwen)")
     parser.add_argument("--search-provider", default="brave", choices=["brave", "ddg"],
                         help="Search provider: 'brave' (default, requires BRAVE_SEARCH_API_KEY) or 'ddg' (DuckDuckGo)")
     args = parser.parse_args()
@@ -594,7 +633,7 @@ def main():
 
     llm = make_llm_client(args.provider)
     search = make_search_tool(args.search_provider)
-    model_label = CLAUDE_MODEL if args.provider == "claude" else OLLAMA_MODEL
+    model_label = {"minimax": MINIMAX_MODEL, "claude": CLAUDE_MODEL, "ollama": OLLAMA_MODEL}.get(args.provider, args.provider)
 
     print(f"\nLLM     : {args.provider} ({model_label})")
     print(f"Search  : {args.search_provider} ({type(search).__name__})")
