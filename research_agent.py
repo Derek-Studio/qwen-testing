@@ -885,6 +885,50 @@ class ResearchAgent:
 
         return json.dumps(promos, ensure_ascii=False)
 
+    def _scrape_social_links(self) -> list[dict]:
+        """Extract social media links from all live pages without any LLM call."""
+        PLATFORMS = {
+            "instagram.com":  ("instagram",  r"instagram\.com/([A-Za-z0-9_.]+)"),
+            "facebook.com":   ("facebook",   r"facebook\.com/(?:pages/[^/]+/)?([A-Za-z0-9_.%-]+)"),
+            "twitter.com":    ("twitter",    r"twitter\.com/([A-Za-z0-9_]+)"),
+            "x.com":          ("x",          r"x\.com/([A-Za-z0-9_]+)"),
+            "tiktok.com":     ("tiktok",     r"tiktok\.com/@?([A-Za-z0-9_.]+)"),
+            "youtube.com":    ("youtube",    r"youtube\.com/(?:@|c/|channel/|user/)?([A-Za-z0-9_%-]+)"),
+            "linkedin.com":   ("linkedin",   r"linkedin\.com/company/([A-Za-z0-9_-]+)"),
+            "threads.net":    ("threads",    r"threads\.net/@?([A-Za-z0-9_.]+)"),
+            "pinterest.com":  ("pinterest",  r"pinterest\.com/([A-Za-z0-9_]+)"),
+            "snapchat.com":   ("snapchat",   r"snapchat\.com/add/([A-Za-z0-9_.-]+)"),
+        }
+        SKIP_PATHS = {"about", "help", "legal", "terms", "privacy", "login", "signup", "explore", "ads"}
+
+        seen_urls: set[str] = set()
+        results: list[dict] = []
+
+        for record in self._live_pages:
+            page = record.get("page")
+            if not page:
+                continue
+            try:
+                hrefs = page.evaluate("() => Array.from(document.querySelectorAll('a[href]')).map(a => a.href)")
+            except Exception:
+                continue
+            for href in hrefs:
+                href = href.split("?")[0].rstrip("/")
+                if href in seen_urls:
+                    continue
+                for domain, (platform, pattern) in PLATFORMS.items():
+                    if domain not in href:
+                        continue
+                    m = re.search(pattern, href, re.IGNORECASE)
+                    username = m.group(1) if m else ""
+                    if username.lower() in SKIP_PATHS:
+                        continue
+                    seen_urls.add(href)
+                    results.append({"platform": platform, "url": href, "username": username})
+                    break
+
+        return results
+
     @staticmethod
     def _fuzzy_find(page_text: str, extract_string: str, threshold: float = 0.6) -> int:
         """Return char offset of best fuzzy match for extract_string in page_text, or -1.
@@ -907,14 +951,22 @@ class ResearchAgent:
                 best_ratio, best_pos = ratio, i
         return best_pos if best_ratio >= threshold else -1
 
-    def _add_rich_screenshots(self, rich_json_str: str) -> str:
-        """Post-process pub-site-mode JSON: screenshot each promotion/event using live pages."""
+    def _add_rich_screenshots(self, rich_json_str: str, website: str | None = None) -> str:
+        """Post-process pub-site-mode JSON: inject website, screenshot each deal/event using live pages."""
         try:
             data = json.loads(rich_json_str)
             if not isinstance(data, dict):
                 return rich_json_str
         except (json.JSONDecodeError, AttributeError):
             return rich_json_str
+
+        if website:
+            data["website"] = website
+
+        social_links = self._scrape_social_links()
+        if social_links:
+            data["social_media"] = social_links
+            print(f"  [social] found {len(social_links)} link(s): {[s['platform'] for s in social_links]}")
 
         os.makedirs("tmp", exist_ok=True)
         live_lookup = {record["url"]: record["page"] for record in self._live_pages if "url" in record and "page" in record}
@@ -1017,19 +1069,21 @@ class ResearchAgent:
 
     def _build_rich_extraction_prompt(self, query: str, combined_text: str) -> tuple[str, str]:
         """Build (system, user) prompt for rich pub data extraction."""
+        _schedule = {"recurring": True, "days": [], "date": "", "time_open": "", "time_close": ""}
         schema_example = {
-            "deals": [{"title": "", "description": "", "category": "", "day": "", "time": "", "source_url": "", "extract_string": ""}],
-            "events": [{"title": "", "description": "", "category": "", "day": "", "time": "", "source_url": "", "extract_string": ""}],
-            "opening_times": {"monday": "", "tuesday": "", "wednesday": "", "thursday": "", "friday": "", "saturday": "", "sunday": "", "source_url": ""},
-            "description": {"text": "", "source_url": ""},
-            "facilities": [{"name": "", "source_url": ""}],
             "pub_emoji": "",
+            "description": {"text": "", "source_url": ""},
+            "deals": [{"title": "", "description": "", "category": "", "schedule": _schedule, "source_url": "", "extract_string": ""}],
+            "events": [{"title": "", "description": "", "category": "", "schedule": _schedule, "source_url": "", "extract_string": ""}],
+            "opening_times": [{"day": "", "open": "", "close": ""}],
+            "facilities": [{"name": "", "source_url": ""}],
         }
         emoji_options = (
-            "🍺 classic/traditional pub  |  🍻 lively/social  |  🎸 live music venue  |  "
-            "📺 sports bar  |  🌿 beer garden/outdoor  |  🍔 food-focused  |  "
-            "🎯 games pub (darts/pool)  |  🥂 upscale/cocktail bar  |  "
-            "🎭 events & entertainment  |  🏘️ neighbourhood local"
+            "🍺 classic/traditional pub  |  🎸 live music venue  |  📺 sports bar  |  "
+            "🌿 beer garden/outdoor  |  🎯 games pub (darts/pool)  |  "
+            "🥂 cocktail bar  |  🥃 whisky bar  |  🍷 wine bar  |  🍸 craft cocktails  |  "
+            "🎭 events & entertainment  |  🏘️ neighbourhood local  |  🪩 late night bar  |  "
+            "☕ brunch & coffee"
         )
         system = (
             "You are a pub data extraction assistant. The text below contains content from multiple web pages.\n"
@@ -1037,24 +1091,23 @@ class ResearchAgent:
             "Extract structured pub information and return a JSON object matching this schema exactly:\n"
             f"{json.dumps(schema_example, indent=2)}\n\n"
             "Field guidance:\n"
-            "- deals[]: discounts, drink specials, happy hours, recurring price offers (NOT events)\n"
-            "  - title: short name for the deal\n"
-            "  - description: full detail of what the deal is\n"
-            "  - category: one of: '2-for-1', 'happy hour', 'meal deal', 'drink special', 'free item', 'discount', 'loyalty offer'\n"
-            "  - day: which days it runs (e.g. 'Thursday', 'Monday–Friday', 'Daily')\n"
-            "  - time: hours active (e.g. '17:00–19:00', 'all day')\n"
-            "- events[]: things happening at the pub — quiz nights, live music, themed nights, sport screenings\n"
-            "  - title: event name\n"
-            "  - description: what happens at the event\n"
-            "  - category: one of: 'quiz night', 'live music', 'karaoke', 'comedy night', 'DJ set', 'open mic', 'sports screening', 'themed night', 'bingo', 'games night'\n"
-            "  - day: date or recurrence pattern (e.g. 'Every Thursday', '14 June 2025')\n"
-            "  - time: start time\n"
-            "- opening_times: hours for each day (e.g. '12:00–23:00'), empty string if unknown\n"
-            "- description.text: 1–2 sentence pub description covering vibe, style, what makes it special\n"
-            "- facilities[]: amenities such as beer garden, pool table, darts, TV screens, private hire,\n"
-            "  dog-friendly, wheelchair access, Wi-Fi, live sports, etc.\n"
             f"- pub_emoji: pick ONE emoji that best matches the pub's overall vibe from this list:\n"
-            f"  {emoji_options}\n\n"
+            f"  {emoji_options}\n"
+            "- description.text: 1–2 sentence pub description covering vibe, style, what makes it special\n"
+            "- deals[]: discounts, drink specials, happy hours, recurring price offers (NOT events)\n"
+            "  - category: one of: '2-for-1', 'happy hour', 'meal deal', 'drink special', 'free item', 'discount', 'loyalty offer'\n"
+            "  - schedule.recurring: true for weekly/regular deals, false for one-off\n"
+            "  - schedule.days: array of lowercase day names e.g. ['monday','thursday'] — use for recurring\n"
+            "  - schedule.date: ISO date e.g. '2025-06-14' — use for one-off only, leave empty if recurring\n"
+            "  - schedule.time_open / time_close: 24h format e.g. '17:00', '21:00' — empty if all day\n"
+            "- events[]: things happening at the pub — quiz nights, live music, themed nights, sport screenings\n"
+            "  - category: one of: 'quiz night', 'live music', 'karaoke', 'comedy night', 'DJ set', 'open mic', 'sports screening', 'themed night', 'bingo', 'games night'\n"
+            "  - schedule: same structure as deals — recurring weekly events use days[], one-off use date\n"
+            "- opening_times[]: one object per day, all 7 days must be present\n"
+            "  - day: lowercase day name e.g. 'monday'\n"
+            "  - open / close: 24h time e.g. '10:00', '23:30' — empty string if closed or unknown\n"
+            "- facilities[]: amenities such as beer garden, pool table, darts, TV screens, private hire,\n"
+            "  dog-friendly, wheelchair access, Wi-Fi, live sports, etc.\n\n"
             "IMPORTANT RULES:\n"
             "1. source_url: copy EXACTLY from the nearest === SOURCE: <url> === header above the item\n"
             "2. extract_string: a verbatim snippet copied EXACTLY from the page text that UNIQUELY identifies\n"
@@ -1078,7 +1131,7 @@ class ResearchAgent:
             home_url = self._find_pub_home_url(pub_name or query, pub_address or "", query)
             if not home_url:
                 print("  [pub_site] Could not find pub website")
-                return json.dumps({"deals": [], "events": [], "opening_times": {}, "description": {}, "facilities": []})
+                return json.dumps({"pub_emoji": "", "description": {}, "deals": [], "events": [], "opening_times": [], "facilities": []})
             print(f"  [pub_site] Found home URL: {home_url}")
 
         combined_text, live_pages = self._crawl_pub_site(home_url, pub_name or "", pub_address or "")
@@ -1086,13 +1139,14 @@ class ResearchAgent:
 
         system, user = self._build_rich_extraction_prompt(query, combined_text)
 
+        _schedule = {"recurring": True, "days": [], "date": "", "time_open": "", "time_close": ""}
         rich_schema = {
-            "deals": [{"title": "", "description": "", "category": "", "day": "", "time": "", "source_url": "", "extract_string": ""}],
-            "events": [{"title": "", "description": "", "category": "", "day": "", "time": "", "source_url": "", "extract_string": ""}],
-            "opening_times": {"monday": "", "tuesday": "", "wednesday": "", "thursday": "", "friday": "", "saturday": "", "sunday": "", "source_url": ""},
-            "description": {"text": "", "source_url": ""},
-            "facilities": [{"name": "", "source_url": ""}],
             "pub_emoji": "",
+            "description": {"text": "", "source_url": ""},
+            "deals": [{"title": "", "description": "", "category": "", "schedule": _schedule, "source_url": "", "extract_string": ""}],
+            "events": [{"title": "", "description": "", "category": "", "schedule": _schedule, "source_url": "", "extract_string": ""}],
+            "opening_times": [{"day": "", "open": "", "close": ""}],
+            "facilities": [{"name": "", "source_url": ""}],
         }
         coerced = _coerce_to_schema(rich_schema)
         user_prompt = user
@@ -1119,18 +1173,18 @@ class ResearchAgent:
             if _JSONSCHEMA_AVAILABLE:
                 try:
                     jsonschema.validate(json.loads(clean), coerced)
-                    return self._add_rich_screenshots(clean)
+                    return self._add_rich_screenshots(clean, home_url)
                 except (json.JSONDecodeError, jsonschema.ValidationError) as e:
                     if attempt < 2:
                         user_prompt = user + f"\n\nPrevious attempt failed: {e}\nReturn ONLY valid JSON."
             else:
                 try:
                     json.loads(clean)
-                    return self._add_rich_screenshots(clean)
+                    return self._add_rich_screenshots(clean, home_url)
                 except json.JSONDecodeError as e:
                     if attempt < 2:
                         user_prompt = user + f"\n\nPrevious attempt failed: {e}\nReturn ONLY valid JSON."
-        return self._add_rich_screenshots(last_response)  # graceful fallback
+        return self._add_rich_screenshots(last_response, home_url)  # graceful fallback
 
     def run(self, query: str, start_url: str | None = None,
             pub_name: str | None = None, pub_address: str | None = None,
