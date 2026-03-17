@@ -971,29 +971,48 @@ class ResearchAgent:
 
     def _build_rich_extraction_prompt(self, query: str, combined_text: str) -> tuple[str, str]:
         """Build (system, user) prompt for rich pub data extraction."""
-        schema = json.dumps({
+        schema_example = {
             "promotions": [{"title": "", "description": "", "discount": "", "days": "", "time": "", "source_url": "", "extract_string": ""}],
             "events": [{"title": "", "description": "", "date": "", "time": "", "source_url": "", "extract_string": ""}],
             "opening_times": {"monday": "", "tuesday": "", "wednesday": "", "thursday": "", "friday": "", "saturday": "", "sunday": "", "source_url": ""},
             "description": {"text": "", "source_url": ""},
             "facilities": [{"name": "", "source_url": ""}],
-        })
+            "pub_emoji": "",
+        }
+        emoji_options = (
+            "🍺 classic/traditional pub  |  🍻 lively/social  |  🎸 live music venue  |  "
+            "📺 sports bar  |  🌿 beer garden/outdoor  |  🍔 food-focused  |  "
+            "🎯 games pub (darts/pool)  |  🥂 upscale/cocktail bar  |  "
+            "🎭 events & entertainment  |  🏘️ neighbourhood local"
+        )
         system = (
             "You are a pub data extraction assistant. The text below contains content from multiple web pages.\n"
-            "Each page section starts with a header: === SOURCE: <url> ===\n"
-            "Extract structured pub information matching this JSON schema exactly:\n"
-            f"{schema}\n\n"
+            "Each page section starts with a header: === SOURCE: <url> ===\n\n"
+            "Extract structured pub information and return a JSON object matching this schema exactly:\n"
+            f"{json.dumps(schema_example, indent=2)}\n\n"
             "Field guidance:\n"
-            "- promotions: recurring deals, happy hours, drink specials, discount offers\n"
-            "- events: one-off or scheduled events (quiz nights, live music, themed nights)\n"
-            "- opening_times: hours for each day of the week\n"
-            "- description: a brief pub description (vibe, style, what makes it special)\n"
-            "- facilities: amenities (beer garden, pool table, darts, TV screens, private hire, dog-friendly, etc.)\n\n"
+            "- promotions[]: recurring deals, happy hours, drink specials, discount offers\n"
+            "  - title: short name for the deal\n"
+            "  - description: full detail of what the deal is\n"
+            "  - discount: price or saving (e.g. '£6', '50% off', 'variable')\n"
+            "  - days: which days it runs (e.g. 'Thursday', 'Monday–Friday')\n"
+            "  - time: hours active (e.g. '17:00–19:00', 'all day')\n"
+            "- events[]: one-off or recurring events (quiz nights, live music, themed nights)\n"
+            "  - title: event name\n"
+            "  - description: what happens at the event\n"
+            "  - date: date or recurrence pattern (e.g. 'Every Thursday', '14 June 2025')\n"
+            "  - time: start time\n"
+            "- opening_times: hours for each day (e.g. '12:00–23:00'), empty string if unknown\n"
+            "- description.text: 1–2 sentence pub description covering vibe, style, what makes it special\n"
+            "- facilities[]: amenities such as beer garden, pool table, darts, TV screens, private hire,\n"
+            "  dog-friendly, wheelchair access, Wi-Fi, live sports, etc.\n"
+            f"- pub_emoji: pick ONE emoji that best matches the pub's overall vibe from this list:\n"
+            f"  {emoji_options}\n\n"
             "IMPORTANT RULES:\n"
             "1. source_url: copy EXACTLY from the nearest === SOURCE: <url> === header above the item\n"
             "2. extract_string: a verbatim 10-20 character snippet from the page text near the item\n"
-            "3. Use [] for list fields with no data found, {} for object fields, empty string for unknown text fields\n"
-            "4. Reply with ONLY valid JSON matching the schema — no markdown fences, no explanation"
+            "3. Use [] for list fields with no data found, {} for object fields, empty string if unknown\n"
+            "4. Reply with ONLY valid JSON — no markdown fences, no explanation"
         )
         user = f"Query: {query}\n\nPage content:\n{combined_text}"
         return system, user
@@ -1022,12 +1041,29 @@ class ResearchAgent:
             "opening_times": {"monday": "", "tuesday": "", "wednesday": "", "thursday": "", "friday": "", "saturday": "", "sunday": "", "source_url": ""},
             "description": {"text": "", "source_url": ""},
             "facilities": [{"name": "", "source_url": ""}],
+            "pub_emoji": "",
         }
         coerced = _coerce_to_schema(rich_schema)
         user_prompt = user
+        last_response = ""
         for attempt in range(3):
             response = self.llm.chat(system, user_prompt)
+            last_response = response
             clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", response.strip())
+
+            # Save prompt + response to tmp/ for analysis
+            try:
+                import time as _time
+                os.makedirs("tmp", exist_ok=True)
+                slug = re.sub(r"[^a-zA-Z0-9]", "_", (pub_name or query or "run"))[:40].strip("_")
+                ts = _time.strftime("%Y%m%d_%H%M%S")
+                dump_path = f"tmp/{slug}_{ts}_attempt{attempt}.json"
+                with open(dump_path, "w", encoding="utf-8") as _f:
+                    json.dump({"system": system, "user": user_prompt, "response": response}, _f, indent=2, ensure_ascii=False)
+                print(f"  [tmp] saved prompt+response → {dump_path}")
+            except Exception as _e:
+                print(f"  [tmp] could not save dump: {_e}")
+
             if _JSONSCHEMA_AVAILABLE:
                 try:
                     jsonschema.validate(json.loads(clean), coerced)
@@ -1042,7 +1078,7 @@ class ResearchAgent:
                 except json.JSONDecodeError as e:
                     if attempt < 2:
                         user_prompt = user + f"\n\nPrevious attempt failed: {e}\nReturn ONLY valid JSON."
-        return response  # graceful fallback
+        return last_response  # graceful fallback
 
     def run(self, query: str, start_url: str | None = None,
             pub_name: str | None = None, pub_address: str | None = None,
