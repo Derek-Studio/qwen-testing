@@ -39,7 +39,7 @@ CANDIDATE_SELECTORS = ["article", "[class*='event']", "[class*='card']", "sectio
 
 OLLAMA_MODEL = "qwen3:1.7b"
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
-MINIMAX_MODEL = "MiniMax-Text-01"
+MINIMAX_MODEL = "MiniMax-M2.5"
 MINIMAX_API_URL = "https://api.minimaxi.chat/v1/chat/completions"
 BASE_URL = "http://localhost:11434"
 MAX_SEARCH_RESULTS = 5
@@ -885,6 +885,28 @@ class ResearchAgent:
 
         return json.dumps(promos, ensure_ascii=False)
 
+    @staticmethod
+    def _fuzzy_find(page_text: str, extract_string: str, threshold: float = 0.6) -> int:
+        """Return char offset of best fuzzy match for extract_string in page_text, or -1.
+        Both strings are normalised (collapse whitespace, strip non-alphanumeric) before comparison,
+        but the returned offset is into the original page_text."""
+        import difflib, re as _re
+        if not extract_string or not page_text:
+            return -1
+
+        def _norm(s):
+            s = _re.sub(r'[^a-zA-Z0-9 ]', ' ', s)
+            return _re.sub(r'\s+', ' ', s).strip().lower()
+
+        norm_extract = _norm(extract_string)
+        n = len(extract_string)
+        best_ratio, best_pos = 0.0, -1
+        for i in range(0, len(page_text) - n + 1):
+            ratio = difflib.SequenceMatcher(None, norm_extract, _norm(page_text[i:i + n]), autojunk=False).ratio()
+            if ratio > best_ratio:
+                best_ratio, best_pos = ratio, i
+        return best_pos if best_ratio >= threshold else -1
+
     def _add_rich_screenshots(self, rich_json_str: str) -> str:
         """Post-process pub-site-mode JSON: screenshot each promotion/event using live pages."""
         try:
@@ -905,7 +927,8 @@ class ResearchAgent:
                     continue
                 page_text, segments = self._url_segments.get(source_url, ("", []))
                 extract_string = item.get("extract_string", "")
-                char_offset = page_text.find(extract_string) if extract_string else -1
+                char_offset = self._fuzzy_find(page_text, extract_string) if extract_string else -1
+                print(f"  [fuzzy] {label}_{i}: {'matched @ {}'.format(char_offset) if char_offset >= 0 else 'NO MATCH'} | {repr(extract_string)}")
                 if char_offset < 0:
                     char_offset = None
                 try:
@@ -923,33 +946,18 @@ class ResearchAgent:
 
     def _find_pub_home_url(self, pub_name: str, pub_address: str, query: str) -> str | None:
         """Single search to find a pub's official website URL."""
+        AGGREGATORS = {
+            "tripadvisor", "yelp", "designmynight", "timeout", "google",
+            "facebook", "instagram", "twitter", "foursquare", "opentable",
+            "bookatable", "squaremeal", "hardens", "matchpint", "pubsgalore",
+        }
         search_query = f'"{pub_name}" pub website {pub_address}'
         print(f"  [find_home] Searching: {search_query}")
         results = self.search.search(search_query, max_results=5)
-        if not results:
-            return None
-        results_text = "\n".join(
-            f"{i+1}. {r['title']} — {r['snippet']}\n   URL: {r['url']}"
-            for i, r in enumerate(results[:5])
-        )
-        system = (
-            "You are a research assistant. Return ONLY the number of the official pub website.\n"
-            "Do NOT pick TripAdvisor, Yelp, DesignMyNight, Google, Timeout, or aggregator sites.\n"
-            "Pick the pub's own website. If none qualifies, return: NONE"
-        )
-        user = (
-            f"Pub: {pub_name}, {pub_address}\n\n{results_text}\n\n"
-            "Which result is the pub's official website? Return only the number or NONE."
-        )
-        response = self.llm.chat(system, user).strip()
-        if response.upper() == "NONE":
-            return None
-        try:
-            idx = int(response) - 1
-            if 0 <= idx < len(results):
-                return results[idx]["url"]
-        except ValueError:
-            pass
+        for r in results:
+            url = r.get("url", "")
+            if not any(agg in url.lower() for agg in AGGREGATORS):
+                return url
         return None
 
     def _crawl_pub_site(self, home_url: str, pub_name: str, pub_address: str) -> tuple[str, list[dict]]:
@@ -1001,6 +1009,8 @@ class ResearchAgent:
             for url, text in page_texts
         ]
         combined = "\n\n".join(parts)
+        # Strip zero-width and other invisible unicode characters that confuse the LLM
+        combined = re.sub(r'[\u200b\u200c\u200d\u00ad\ufeff\u2060]', '', combined)
         if len(combined) > MAX_TOTAL_CHARS:
             combined = combined[:MAX_TOTAL_CHARS]
         return combined, self._live_pages
@@ -1050,7 +1060,8 @@ class ResearchAgent:
             "2. extract_string: a verbatim snippet copied EXACTLY from the page text that UNIQUELY identifies\n"
             "   where on the page this item appears — used to locate the precise DOM element for screenshotting.\n"
             "   Must be at least 20 characters. Prefer 25–40 characters. Must appear verbatim in the source text.\n"
-            "   Include enough surrounding context (e.g. title + price, or title + day) to be unique on the page.\n"
+            "   Copy from the most DETAILED section of the page (the full description block), NOT from summary\n"
+            "   lists or repeated compact listings. Preserve the exact word order as it appears in the text.\n"
             "3. Use [] for list fields with no data found, {} for object fields, empty string if unknown\n"
             "4. Reply with ONLY valid JSON — no markdown fences, no explanation"
         )
@@ -1090,6 +1101,7 @@ class ResearchAgent:
             response = self.llm.chat(system, user_prompt)
             last_response = response
             clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", response.strip())
+            clean = re.sub(r"<think>.*?</think>\s*", "", clean, flags=re.DOTALL).strip()
 
             # Save prompt + response to tmp/ for analysis
             try:
