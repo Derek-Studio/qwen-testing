@@ -35,6 +35,8 @@ try:
 except ImportError:
     _ANTHROPIC_AVAILABLE = False
 
+CANDIDATE_SELECTORS = ["article", "[class*='event']", "[class*='card']", "section", "li"]
+
 OLLAMA_MODEL = "qwen3:1.7b"
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 MINIMAX_MODEL = "MiniMax-Text-01"
@@ -50,6 +52,10 @@ OLLAMA_TIMEOUT = 180
 MAX_RESULTS_FOR_SELECTION = 6
 NETWORKIDLE_TIMEOUT = 5000   # ms; raise to 15000 for production
 SCROLL_DELAY = 500           # ms; raise to 1500 for production
+SCREENSHOT_MIN_AREA_PCT = 0.05   # bbox must be ≥ 5% of viewport to be a useful card
+SCREENSHOT_MAX_AREA_PCT = 0.60   # bbox must be ≤ 60% to avoid grabbing whole page
+SCREENSHOT_PADDING = 16
+SCREENSHOT_LEVELS = 10
 
 
 def _extract_text(html: str) -> str:
@@ -275,8 +281,9 @@ class BrowserTool:
         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
 
-    def __init__(self):
+    def __init__(self, screenshot_dir: str | None = None):
         self._pw = self._browser = self._context = None
+        self.screenshot_dir = screenshot_dir
 
     def start(self):
         from playwright.sync_api import sync_playwright
@@ -307,6 +314,199 @@ class BrowserTool:
     def __exit__(self, *_):
         self.close()
 
+    def _screenshot_promo_cropped(self, page, url: str, promo_index: int, keyword: str) -> str | None:
+        """Take a cropped screenshot of the element best matching keyword, with DOM-walk bbox selection."""
+        from pathlib import Path
+        slug = re.sub(r"[^a-zA-Z0-9]", "_", url)[:60].strip("_")
+        out_path = str(Path(self.screenshot_dir) / f"{slug}_{promo_index}.png")
+
+        # Find the element matching the keyword
+        el_handle = None
+        for selector in CANDIDATE_SELECTORS:
+            try:
+                loc = page.locator(selector).filter(has_text=keyword)
+                if loc.count() > 0:
+                    loc.first.scroll_into_view_if_needed()
+                    el_handle = loc.first.element_handle()
+                    break
+            except Exception:
+                continue
+
+        if el_handle is None:
+            page.screenshot(path=out_path, full_page=True)
+            return out_path
+
+        # Walk up DOM collecting viewport-relative bboxes
+        boxes = page.evaluate("""el => {
+            const vw = window.innerWidth, vh = window.innerHeight;
+            const result = [];
+            let cur = el;
+            for (let i = 0; i < 8 && cur && cur.tagName !== 'BODY'; i++) {
+                const r = cur.getBoundingClientRect();
+                result.push({ x: r.x, y: r.y, width: r.width, height: r.height,
+                              pct: (r.width * r.height) / (vw * vh) });
+                cur = cur.parentElement;
+            }
+            return result;
+        }""", el_handle)
+
+        # Pick first ancestor >= MIN_AREA_PCT and <= MAX_AREA_PCT; fall back to largest
+        best = next((b for b in boxes if b["pct"] >= SCREENSHOT_MIN_AREA_PCT
+                                     and b["pct"] <= SCREENSHOT_MAX_AREA_PCT), None)
+        if best is None:
+            best = max(boxes, key=lambda b: b["pct"]) if boxes else None
+        if best is None:
+            page.screenshot(path=out_path, full_page=True)
+            return out_path
+
+        vw = page.viewport_size["width"]
+        vh = page.viewport_size["height"]
+        clip = {
+            "x":      max(0, best["x"] - SCREENSHOT_PADDING),
+            "y":      max(0, best["y"] - SCREENSHOT_PADDING),
+            "width":  min(vw - max(0, best["x"] - SCREENSHOT_PADDING),
+                          best["width"]  + 2 * SCREENSHOT_PADDING),
+            "height": min(vh - max(0, best["y"] - SCREENSHOT_PADDING),
+                          best["height"] + 2 * SCREENSHOT_PADDING),
+        }
+        page.screenshot(path=out_path, clip=clip)
+        return out_path
+
+    def _screenshot_promo_all_levels(self, page, url, promo_index, char_offset, segments):
+        from pathlib import Path
+        slug = re.sub(r"[^a-zA-Z0-9]", "_", url)[:60].strip("_")
+        base = Path(self.screenshot_dir)
+
+        def fallback():
+            out = str(base / f"{slug}_{promo_index}_lv0.png")
+            try:
+                page.screenshot(path=out, full_page=True)
+            except Exception:
+                pass
+            return (out, [out])
+
+        if char_offset is None or not segments:
+            return fallback()
+
+        # Binary search for segment containing char_offset
+        lo, hi, target_seg = 0, len(segments) - 1, None
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            seg = segments[mid]
+            if seg["end"] < char_offset:
+                lo = mid + 1
+            elif seg["start"] > char_offset:
+                hi = mid - 1
+            else:
+                target_seg = seg
+                break
+        if target_seg is None:
+            return fallback()
+
+        # Find live DOM element at char offset (must use evaluate_handle — DOM elements can't be JSON-serialized)
+        try:
+            element = page.evaluate_handle("""({targetStart}) => {
+                const SKIP = new Set(['SCRIPT','STYLE','NAV','FOOTER','HEADER','ASIDE','NOSCRIPT']);
+                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+                    acceptNode(node) {
+                        let el = node.parentElement;
+                        while (el) { if (SKIP.has(el.tagName)) return NodeFilter.FILTER_REJECT; el = el.parentElement; }
+                        return node.textContent.trim() ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
+                    }
+                });
+                let offset = 0, node;
+                while ((node = walker.nextNode())) {
+                    const txt = node.textContent.trim(); if (!txt) continue;
+                    if (offset <= targetStart && targetStart <= offset + txt.length)
+                        return node.parentElement;
+                    offset += txt.length + 1;
+                }
+                return null;
+            }""", {"targetStart": target_seg["start"]})
+            if element.as_element() is None:
+                element = None
+        except Exception:
+            element = None
+        if element is None:
+            return fallback()
+
+        # Walk up SCREENSHOT_LEVELS ancestors
+        try:
+            ancestor_boxes = page.evaluate(f"""(el) => {{
+                const vw = window.innerWidth, vh = window.innerHeight;
+                const results = []; let cur = el;
+                for (let i = 0; i < {SCREENSHOT_LEVELS} && cur && cur.tagName !== 'BODY'; i++) {{
+                    const r = cur.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0)
+                        results.push({{ level: i, x: r.x, y: r.y, width: r.width, height: r.height }});
+                    cur = cur.parentElement;
+                }}
+                return results;
+            }}""", element)
+        except Exception:
+            return fallback()
+        if not ancestor_boxes:
+            return fallback()
+
+        # Screenshot each level
+        vw, vh = page.viewport_size["width"], page.viewport_size["height"]
+        all_paths = []
+        successful: list[tuple[str, float, float]] = []  # (path, clip_width, clip_area)
+        for box in ancestor_boxes:
+            n = box["level"]
+            out = str(base / f"{slug}_{promo_index}_lv{n}.png")
+            x0 = max(0.0, box["x"] - SCREENSHOT_PADDING)
+            y0 = max(0.0, box["y"] - SCREENSHOT_PADDING)
+            cw = min(float(vw) - x0, box["width"]  + 2 * SCREENSHOT_PADDING)
+            ch = min(float(vh) - y0, box["height"] + 2 * SCREENSHOT_PADDING)
+            clip = {"x": x0, "y": y0, "width": cw, "height": ch}
+            try:
+                page.screenshot(path=out, clip=clip)
+                all_paths.append(out)
+                successful.append((out, cw, cw * ch))
+            except Exception as e:
+                print(f"      [screenshot] lv{n} failed: {e}")
+
+        if not successful:
+            return fallback()
+
+        # Pick first level ≥ 80% viewport width; fall back to largest area
+        primary_path = next(
+            (p for p, cw, _ in successful if cw >= 0.8 * vw),
+            max(successful, key=lambda t: t[2])[0]
+        )
+        return (primary_path, all_paths)
+
+    def _build_js_segments(self, page) -> tuple[str, list[dict]]:
+        try:
+            segments = page.evaluate("""() => {
+                const SKIP = new Set(['SCRIPT','STYLE','NAV','FOOTER','HEADER','ASIDE','NOSCRIPT']);
+                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+                    acceptNode(node) {
+                        let el = node.parentElement;
+                        while (el) { if (SKIP.has(el.tagName)) return NodeFilter.FILTER_REJECT; el = el.parentElement; }
+                        return node.textContent.trim() ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
+                    }
+                });
+                const results = []; let offset = 0; let node;
+                while ((node = walker.nextNode())) {
+                    const txt = node.textContent.trim(); if (!txt) continue;
+                    const el = node.parentElement; if (!el) continue;
+                    const r = el.getBoundingClientRect();
+                    if (r.width === 0 && r.height === 0) continue;
+                    results.push({ text: txt, start: offset, end: offset + txt.length,
+                                   x: r.x, y: r.y, width: r.width, height: r.height });
+                    offset += txt.length + 1;
+                }
+                return results;
+            }""")
+            if not segments:
+                return ("", [])
+            return ("\n".join(s["text"] for s in segments), segments)
+        except Exception as e:
+            print(f"      [segments] JS TreeWalker failed: {e}")
+            return ("", [])
+
     def _try_http_fetch(self, url: str) -> str | None:
         """Fast HTTP fetch via requests. Returns extracted text or None on failure."""
         try:
@@ -322,14 +522,14 @@ class BrowserTool:
             return None
 
     def fetch_page(self, url: str) -> dict:
-        # 1. Try fast HTTP fetch first
-        text = self._try_http_fetch(url)
-        if text and len(text) >= 500:
-            return {"url": url, "text": text[:MAX_PAGE_CHARS], "links": []}
+        # 1. Try fast HTTP fetch first (skip when screenshot_dir set — need Playwright for segments)
+        if not self.screenshot_dir:
+            text = self._try_http_fetch(url)
+            if text and len(text) >= 500:
+                return {"url": url, "text": text[:MAX_PAGE_CHARS], "links": [], "segments": []}
 
         # 2. Fall back to Playwright
         if self._context is None:
-            # Support calling without explicit start() for backwards compatibility
             self.start()
         page = self._context.new_page()
         try:
@@ -340,12 +540,14 @@ class BrowserTool:
                 pass
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             page.wait_for_timeout(SCROLL_DELAY)
+            js_text, segments = self._build_js_segments(page)
             html = page.content()
-            text = _extract_text(html)
+            bs4_text = _extract_text(html)
+            primary_text = js_text if js_text else bs4_text
             links = _extract_links(page, url)
-            return {"url": url, "text": text[:MAX_PAGE_CHARS], "links": links}
+            return {"url": url, "text": primary_text[:MAX_PAGE_CHARS], "links": links, "segments": segments}
         except Exception as e:
-            return {"url": url, "text": f"Error fetching page: {e}", "links": []}
+            return {"url": url, "text": f"Error fetching page: {e}", "links": [], "segments": []}
         finally:
             page.close()
 
@@ -408,7 +610,7 @@ def debug_fetch(url: str) -> None:
 
 def _batch_worker(args: tuple) -> dict:
     """Top-level worker for ProcessPoolExecutor — must be picklable (no closures)."""
-    pub, provider, search_provider, schema = args
+    pub, provider, search_provider, schema, screenshot_dir = args
     name = pub.get("name", pub.get("url", "unknown"))
     query = pub.get("query") or f"what promotions are taking place at {name}"
     url = pub.get("url") or None
@@ -416,7 +618,7 @@ def _batch_worker(args: tuple) -> dict:
     try:
         llm = make_llm_client(provider)
         search = make_search_tool(search_provider)
-        agent = ResearchAgent(llm=llm, search=search, browser=BrowserTool(), schema=schema)
+        agent = ResearchAgent(llm=llm, search=search, browser=BrowserTool(screenshot_dir=screenshot_dir), schema=schema)
         result = agent.run(query, start_url=url)
         print(f"[{name}] done", flush=True)
         return {"pub": name, "query": query, "result": result, "error": None}
@@ -425,7 +627,7 @@ def _batch_worker(args: tuple) -> dict:
         return {"pub": name, "query": query, "result": None, "error": str(e)}
 
 
-def run_batch(batch_file: str, provider: str, search_provider: str, schema, workers: int) -> None:
+def run_batch(batch_file: str, provider: str, search_provider: str, schema, workers: int, screenshot_dir: str | None = None) -> None:
     import time
     from concurrent.futures import ProcessPoolExecutor
     with open(batch_file) as f:
@@ -441,7 +643,7 @@ def run_batch(batch_file: str, provider: str, search_provider: str, schema, work
     print("=" * 60)
 
     results = []
-    worker_args = [(pub, provider, search_provider, schema) for pub in pubs]
+    worker_args = [(pub, provider, search_provider, schema, screenshot_dir) for pub in pubs]
     with ProcessPoolExecutor(max_workers=workers) as executor:
         futures = [executor.submit(_batch_worker, a) for a in worker_args]
         for future in as_completed(futures):
@@ -461,37 +663,106 @@ class ResearchAgent:
         self.search = search
         self.browser = browser
         self.schema = schema
+        self._url_segments: dict[str, list[dict]] = {}
 
-    def _extract_relevant(self, query: str, page_text: str, page_url: str) -> str:
+    def _extract_relevant(self, query: str, page_text: str, page_url: str) -> tuple[str, list[int]]:
         system = (
             "You are a research assistant extracting pub promotion details from a web page.\n"
             "Extract ANY of the following: deals, discounts, happy hours, quiz nights, events, "
             "special pricing, drink specials, weekly offers, or recurring promotions.\n"
-            "Also extract: drink prices (cocktails, pints, shots), event days/times, "
-            "recurring weekly specials, and any 'what's on' or 'offers' information.\n"
-            "Reply with ONLY the relevant text copied or lightly paraphrased from the page.\n"
-            "Include specific details: prices, percentages, days of the week, time ranges.\n"
-            "Only reply with exactly: NOTHING_RELEVANT if the page has truly no pub info at all "
-            "(e.g. a privacy policy page, a completely unrelated site).\n"
-            "Do not add commentary, headers, or explanation."
+            "Reply with a JSON array. Each element must have:\n"
+            "  'excerpt': the relevant text copied or lightly paraphrased from the page\n"
+            "  'key_phrase': a verbatim phrase (max 60 chars) copied EXACTLY as it appears on the page "
+            "                that uniquely identifies where this info is located\n"
+            "Reply with exactly NOTHING_RELEVANT if the page has truly no pub info.\n"
+            "No commentary outside the JSON."
         )
         user = (
-            f"Query: {query}\n"
-            f"Page URL: {page_url}\n\n"
-            f"Page content:\n{page_text}\n\n"
-            "Extract every passage about pub drinks, pricing, promotions, deals, discounts, "
-            "happy hours, quiz nights, weekly specials, or events. Include prices, days, and times."
+            f"Query: {query}\nPage URL: {page_url}\n\nPage content:\n{page_text}\n\n"
+            "Return a JSON array of {\"excerpt\": \"...\", \"key_phrase\": \"...\"} objects."
         )
         response = self.llm.chat(system, user)
         if response.strip().upper() == "NOTHING_RELEVANT":
-            return ""
-        return response[:EXTRACT_CHARS]
+            return ("", [])
+        clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", response.strip())
+        try:
+            items = json.loads(clean)
+            if not isinstance(items, list):
+                raise ValueError
+            excerpts, offsets = [], []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("excerpt"):
+                    excerpts.append(item["excerpt"])
+                kp = item.get("key_phrase", "")
+                if kp:
+                    offset = page_text.find(kp)
+                    if offset >= 0:
+                        offsets.append(offset)
+            return ("\n".join(excerpts)[:EXTRACT_CHARS], offsets)
+        except (json.JSONDecodeError, ValueError):
+            return (response[:EXTRACT_CHARS], [])
+
+    def _add_promo_screenshots(self, json_str: str) -> str:
+        """Post-process synthesized JSON: take one cropped screenshot per promotion."""
+        try:
+            promos = json.loads(json_str)
+            if not isinstance(promos, list):
+                return json_str
+        except (json.JSONDecodeError, AttributeError):
+            return json_str
+
+        from pathlib import Path
+        Path(self.browser.screenshot_dir).mkdir(parents=True, exist_ok=True)
+
+        # Group by source_url — one page load per URL
+        url_groups: dict[str, list[tuple[int, dict]]] = {}
+        for i, promo in enumerate(promos):
+            url = promo.get("source_url", "")
+            if url:
+                url_groups.setdefault(url, []).append((i, promo))
+
+        for url, group in url_groups.items():
+            if self.browser._context is None:
+                self.browser.start()
+            page = self.browser._context.new_page()
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=NETWORKIDLE_TIMEOUT)
+                except Exception:
+                    pass
+                for i, promo in group:
+                    char_offset = promo.get("source_char_offset")
+                    if char_offset is not None:
+                        try:
+                            char_offset = int(char_offset)
+                        except (TypeError, ValueError):
+                            char_offset = None
+                    segments = self._url_segments.get(url, [])
+                    primary_path, all_paths = self.browser._screenshot_promo_all_levels(
+                        page, url, i, char_offset, segments
+                    )
+                    if primary_path:
+                        promos[i]["screenshot_path"] = primary_path
+                        print(f"  [screenshot] promo {i}: {primary_path} ({len(all_paths)} levels)")
+            except Exception as e:
+                print(f"  [screenshot] failed for {url}: {e}")
+            finally:
+                page.close()
+
+        return json.dumps(promos, ensure_ascii=False)
 
     def run(self, query: str, start_url: str | None = None) -> str:
         gathered_info: list[str] = []
+        self._url_segments = {}
         self.browser.start()
         try:
-            return self._run(query, start_url, gathered_info)
+            result = self._run(query, start_url, gathered_info)
+            if self.browser.screenshot_dir and self.schema:
+                result = self._add_promo_screenshots(result)   # browser still open here
+            return result
         finally:
             self.browser.close()
 
@@ -500,10 +771,12 @@ class ResearchAgent:
         if start_url:
             print(f"[SKIP SEARCH] Using provided start URL: {start_url}")
             page_data = self.browser.fetch_page(start_url)
-            extracted = self._extract_relevant(query, page_data["text"], page_data["url"])
+            self._url_segments[page_data["url"]] = page_data.get("segments", [])
+            extracted, offsets = self._extract_relevant(query, page_data["text"], page_data["url"])
             print(f"      Retrieved {len(page_data['text'])} chars raw, {len(extracted)} chars relevant")
             if extracted:
-                gathered_info.append(f"[SOURCE_URL: {page_data['url']}]\n{extracted}")
+                offset_str = ",".join(str(o) for o in offsets) if offsets else ""
+                gathered_info.append(f"[SOURCE_URL: {page_data['url']}]\n[CHAR_OFFSETS: {offset_str}]\n{extracted}")
             # Proceed directly to synthesis
             print("[8/8] Synthesizing answer...")
             if not gathered_info:
@@ -523,7 +796,9 @@ class ResearchAgent:
                     "- discount: the price or saving (e.g. '£6', '50% off', 'variable')\n"
                     "- days: which days of the week it runs\n"
                     "- time: the hours it is active\n"
-                    "- source_url: copy from [SOURCE_URL: <url>] tag above the relevant content\n\n"
+                    "- source_url: copy from [SOURCE_URL: <url>] tag above the relevant content\n"
+                    "- source_char_offset: (optional integer) pick the most relevant number from [CHAR_OFFSETS: ...]\n"
+                    "  in the section where you found this promotion; omit if no offsets listed\n\n"
                     "Reply with ONLY the JSON array, no explanation."
                 )
                 user_synth = f"Query: {query}\n\nResearch:\n{combined}"
@@ -634,27 +909,30 @@ class ResearchAgent:
         for url in urls_to_browse:
             pd = self.browser.fetch_page(url)
             fetched_pages[pd["url"]] = pd
+            self._url_segments[pd["url"]] = pd.get("segments", [])
 
         # Extract relevant content
         page_data = None
         for url in urls_to_browse:
-            pd = fetched_pages.get(url, {"url": url, "text": "", "links": []})
+            pd = fetched_pages.get(url, {"url": url, "text": "", "links": [], "segments": []})
             raw_chars = len(pd["text"])
-            extracted = self._extract_relevant(query, pd["text"], pd["url"])
+            extracted, offsets = self._extract_relevant(query, pd["text"], pd["url"])
             print(f"      {pd['url']}: {raw_chars} chars raw, {len(extracted)} chars relevant")
             if extracted:
-                gathered_info.append(f"[SOURCE_URL: {pd['url']}]\n{extracted}")
+                offset_str = ",".join(str(o) for o in offsets) if offsets else ""
+                gathered_info.append(f"[SOURCE_URL: {pd['url']}]\n[CHAR_OFFSETS: {offset_str}]\n{extracted}")
             if page_data is None:
                 page_data = pd  # use best-pick as starting page for hop loop
 
         if page_data is None:
             page_data = self.browser.fetch_page(selection_pool[idx]["url"])
-        extracted = self._extract_relevant(query, page_data["text"], page_data["url"])
+            self._url_segments[page_data["url"]] = page_data.get("segments", [])
+        extracted, offsets = self._extract_relevant(query, page_data["text"], page_data["url"])
 
         # Steps 5–7: Evaluate sufficiency (up to MAX_BROWSE_ITERATIONS hops)
         hop = 0
         current_page = page_data
-        current_extracted = extracted
+        current_extracted = extracted  # extracted from the page_data re-extraction above
         while hop < MAX_BROWSE_ITERATIONS:
             step_label = hop + 5
             print(f"[{step_label}/8] Evaluating page content...")
@@ -665,11 +943,13 @@ class ResearchAgent:
                     follow_url = current_page["links"][0]["url"]
                     print(f"      No relevant content — following first link: {follow_url}")
                     current_page = self.browser.fetch_page(follow_url)
+                    self._url_segments[current_page["url"]] = current_page.get("segments", [])
                     raw_chars = len(current_page["text"])
-                    current_extracted = self._extract_relevant(query, current_page["text"], current_page["url"])
+                    current_extracted, offsets = self._extract_relevant(query, current_page["text"], current_page["url"])
                     print(f"      Retrieved {raw_chars} chars raw, extracted {len(current_extracted)} chars relevant")
                     if current_extracted:
-                        gathered_info.append(f"[SOURCE_URL: {current_page['url']}]\n{current_extracted}")
+                        offset_str = ",".join(str(o) for o in offsets) if offsets else ""
+                        gathered_info.append(f"[SOURCE_URL: {current_page['url']}]\n[CHAR_OFFSETS: {offset_str}]\n{current_extracted}")
                     hop += 1
                     continue
                 else:
@@ -706,11 +986,13 @@ class ResearchAgent:
                         follow_url = current_page["links"][link_idx]["url"]
                         print(f"[{step_label + 1}/8] Following link: {follow_url}")
                         current_page = self.browser.fetch_page(follow_url)
+                        self._url_segments[current_page["url"]] = current_page.get("segments", [])
                         raw_chars = len(current_page["text"])
-                        current_extracted = self._extract_relevant(query, current_page["text"], current_page["url"])
+                        current_extracted, offsets = self._extract_relevant(query, current_page["text"], current_page["url"])
                         print(f"      Retrieved {raw_chars} chars raw, extracted {len(current_extracted)} chars relevant")
                         if current_extracted:
-                            gathered_info.append(f"[SOURCE_URL: {current_page['url']}]\n{current_extracted}")
+                            offset_str = ",".join(str(o) for o in offsets) if offsets else ""
+                            gathered_info.append(f"[SOURCE_URL: {current_page['url']}]\n[CHAR_OFFSETS: {offset_str}]\n{current_extracted}")
                         hop += 1
                         continue
                 except (ValueError, IndexError):
@@ -738,7 +1020,9 @@ class ResearchAgent:
                 "- discount: the price or saving (e.g. '£6', '50% off', '£75 bar tab', 'variable')\n"
                 "- days: which days of the week it runs (e.g. 'Thursday', 'Friday, Saturday')\n"
                 "- time: the hours it is active (e.g. '22:00-00:00', '17:30-close', 'all day')\n"
-                "- source_url: the EXACT URL shown in [SOURCE_URL: ...] above the content where this promotion appeared\n\n"
+                "- source_url: the EXACT URL shown in [SOURCE_URL: ...] above the content where this promotion appeared\n"
+                "- source_char_offset: (optional integer) pick the most relevant number from [CHAR_OFFSETS: ...]\n"
+                "  in the section where you found this promotion; omit if no offsets listed\n\n"
                 "IMPORTANT: For source_url, copy the URL exactly from [SOURCE_URL: <url>] tags in the research. "
                 "Do not invent URLs. Reply with ONLY the JSON array, no explanation."
             )
@@ -786,6 +1070,8 @@ def main():
                         help="JSON file with list of {name, url?, query?} objects to research in parallel")
     parser.add_argument("--workers", type=int, default=5,
                         help="Number of parallel workers for --batch-file (default: 5)")
+    parser.add_argument("--screenshot-dir", default=None,
+                        help="Directory to save page screenshots; adds screenshot_path to each promotion in JSON output")
     args = parser.parse_args()
 
     if args.debug_url:
@@ -806,7 +1092,7 @@ def main():
                 sys.exit(1)
 
     if args.batch_file:
-        run_batch(args.batch_file, args.provider, args.search_provider, schema, args.workers)
+        run_batch(args.batch_file, args.provider, args.search_provider, schema, args.workers, args.screenshot_dir)
         sys.exit(0)
 
     if args.query:
@@ -825,8 +1111,10 @@ def main():
     print(f"Query   : {query}")
     if schema:
         print(f"Schema  : {json.dumps(schema)}")
+    if args.screenshot_dir:
+        print(f"Screenshots: {args.screenshot_dir}")
     print("=" * 60)
-    agent = ResearchAgent(llm=llm, search=search, browser=BrowserTool(), schema=schema)
+    agent = ResearchAgent(llm=llm, search=search, browser=BrowserTool(screenshot_dir=args.screenshot_dir), schema=schema)
     answer = agent.run(query, start_url=args.start_url)
     print("=" * 60)
     print(answer)
