@@ -663,46 +663,27 @@ class ResearchAgent:
         self.search = search
         self.browser = browser
         self.schema = schema
-        self._url_segments: dict[str, list[dict]] = {}
+        self._url_segments: dict[str, tuple[str, list[dict]]] = {}  # url → (page_text, segments)
 
-    def _extract_relevant(self, query: str, page_text: str, page_url: str) -> tuple[str, list[int]]:
+    def _extract_relevant(self, query: str, page_text: str, page_url: str) -> str:
         system = (
             "You are a research assistant extracting pub promotion details from a web page.\n"
             "Extract ANY of the following: deals, discounts, happy hours, quiz nights, events, "
             "special pricing, drink specials, weekly offers, or recurring promotions.\n"
-            "Reply with a JSON array. Each element must have:\n"
-            "  'excerpt': the relevant text copied or lightly paraphrased from the page\n"
-            "  'key_phrase': a verbatim phrase (max 60 chars) copied EXACTLY as it appears on the page "
-            "                that uniquely identifies where this info is located\n"
-            "Reply with exactly NOTHING_RELEVANT if the page has truly no pub info.\n"
-            "No commentary outside the JSON."
+            "Reply with ONLY the relevant text copied or lightly paraphrased from the page.\n"
+            "Include specific details: prices, percentages, days of the week, time ranges.\n"
+            "Only reply with exactly: NOTHING_RELEVANT if the page has truly no pub info at all.\n"
+            "Do not add commentary, headers, or explanation."
         )
         user = (
             f"Query: {query}\nPage URL: {page_url}\n\nPage content:\n{page_text}\n\n"
-            "Return a JSON array of {\"excerpt\": \"...\", \"key_phrase\": \"...\"} objects."
+            "Extract every passage about pub drinks, pricing, promotions, deals, discounts, "
+            "happy hours, quiz nights, weekly specials, or events. Include prices, days, and times."
         )
         response = self.llm.chat(system, user)
         if response.strip().upper() == "NOTHING_RELEVANT":
-            return ("", [])
-        clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", response.strip())
-        try:
-            items = json.loads(clean)
-            if not isinstance(items, list):
-                raise ValueError
-            excerpts, offsets = [], []
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                if item.get("excerpt"):
-                    excerpts.append(item["excerpt"])
-                kp = item.get("key_phrase", "")
-                if kp:
-                    offset = page_text.find(kp)
-                    if offset >= 0:
-                        offsets.append(offset)
-            return ("\n".join(excerpts)[:EXTRACT_CHARS], offsets)
-        except (json.JSONDecodeError, ValueError):
-            return (response[:EXTRACT_CHARS], [])
+            return ""
+        return response[:EXTRACT_CHARS]
 
     def _add_promo_screenshots(self, json_str: str) -> str:
         """Post-process synthesized JSON: take one cropped screenshot per promotion."""
@@ -733,14 +714,12 @@ class ResearchAgent:
                     page.wait_for_load_state("networkidle", timeout=NETWORKIDLE_TIMEOUT)
                 except Exception:
                     pass
+                page_text, segments = self._url_segments.get(url, ("", []))
                 for i, promo in group:
-                    char_offset = promo.get("source_char_offset")
-                    if char_offset is not None:
-                        try:
-                            char_offset = int(char_offset)
-                        except (TypeError, ValueError):
-                            char_offset = None
-                    segments = self._url_segments.get(url, [])
+                    anchor = promo.get("source_text_anchor", "")
+                    char_offset = page_text.find(anchor) if anchor else -1
+                    if char_offset < 0:
+                        char_offset = None
                     primary_path, all_paths = self.browser._screenshot_promo_all_levels(
                         page, url, i, char_offset, segments
                     )
@@ -771,12 +750,11 @@ class ResearchAgent:
         if start_url:
             print(f"[SKIP SEARCH] Using provided start URL: {start_url}")
             page_data = self.browser.fetch_page(start_url)
-            self._url_segments[page_data["url"]] = page_data.get("segments", [])
-            extracted, offsets = self._extract_relevant(query, page_data["text"], page_data["url"])
+            self._url_segments[page_data["url"]] = (page_data.get("text", ""), page_data.get("segments", []))
+            extracted = self._extract_relevant(query, page_data["text"], page_data["url"])
             print(f"      Retrieved {len(page_data['text'])} chars raw, {len(extracted)} chars relevant")
             if extracted:
-                offset_str = ",".join(str(o) for o in offsets) if offsets else ""
-                gathered_info.append(f"[SOURCE_URL: {page_data['url']}]\n[CHAR_OFFSETS: {offset_str}]\n{extracted}")
+                gathered_info.append(f"[SOURCE_URL: {page_data['url']}]\n{extracted}")
             # Proceed directly to synthesis
             print("[8/8] Synthesizing answer...")
             if not gathered_info:
@@ -797,8 +775,8 @@ class ResearchAgent:
                     "- days: which days of the week it runs\n"
                     "- time: the hours it is active\n"
                     "- source_url: copy from [SOURCE_URL: <url>] tag above the relevant content\n"
-                    "- source_char_offset: (optional integer) pick the most relevant number from [CHAR_OFFSETS: ...]\n"
-                    "  in the section where you found this promotion; omit if no offsets listed\n\n"
+                    "- source_text_anchor: a verbatim 20-30 character snippet copied EXACTLY from the page text\n"
+                    "  near where this promotion appears; used to locate the element for screenshotting\n\n"
                     "Reply with ONLY the JSON array, no explanation."
                 )
                 user_synth = f"Query: {query}\n\nResearch:\n{combined}"
@@ -909,25 +887,24 @@ class ResearchAgent:
         for url in urls_to_browse:
             pd = self.browser.fetch_page(url)
             fetched_pages[pd["url"]] = pd
-            self._url_segments[pd["url"]] = pd.get("segments", [])
+            self._url_segments[pd["url"]] = (pd.get("text", ""), pd.get("segments", []))
 
         # Extract relevant content
         page_data = None
         for url in urls_to_browse:
             pd = fetched_pages.get(url, {"url": url, "text": "", "links": [], "segments": []})
             raw_chars = len(pd["text"])
-            extracted, offsets = self._extract_relevant(query, pd["text"], pd["url"])
+            extracted = self._extract_relevant(query, pd["text"], pd["url"])
             print(f"      {pd['url']}: {raw_chars} chars raw, {len(extracted)} chars relevant")
             if extracted:
-                offset_str = ",".join(str(o) for o in offsets) if offsets else ""
-                gathered_info.append(f"[SOURCE_URL: {pd['url']}]\n[CHAR_OFFSETS: {offset_str}]\n{extracted}")
+                gathered_info.append(f"[SOURCE_URL: {pd['url']}]\n{extracted}")
             if page_data is None:
                 page_data = pd  # use best-pick as starting page for hop loop
 
         if page_data is None:
             page_data = self.browser.fetch_page(selection_pool[idx]["url"])
-            self._url_segments[page_data["url"]] = page_data.get("segments", [])
-        extracted, offsets = self._extract_relevant(query, page_data["text"], page_data["url"])
+            self._url_segments[page_data["url"]] = (page_data.get("text", ""), page_data.get("segments", []))
+        extracted = self._extract_relevant(query, page_data["text"], page_data["url"])
 
         # Steps 5–7: Evaluate sufficiency (up to MAX_BROWSE_ITERATIONS hops)
         hop = 0
@@ -943,13 +920,12 @@ class ResearchAgent:
                     follow_url = current_page["links"][0]["url"]
                     print(f"      No relevant content — following first link: {follow_url}")
                     current_page = self.browser.fetch_page(follow_url)
-                    self._url_segments[current_page["url"]] = current_page.get("segments", [])
+                    self._url_segments[current_page["url"]] = (current_page.get("text", ""), current_page.get("segments", []))
                     raw_chars = len(current_page["text"])
-                    current_extracted, offsets = self._extract_relevant(query, current_page["text"], current_page["url"])
+                    current_extracted = self._extract_relevant(query, current_page["text"], current_page["url"])
                     print(f"      Retrieved {raw_chars} chars raw, extracted {len(current_extracted)} chars relevant")
                     if current_extracted:
-                        offset_str = ",".join(str(o) for o in offsets) if offsets else ""
-                        gathered_info.append(f"[SOURCE_URL: {current_page['url']}]\n[CHAR_OFFSETS: {offset_str}]\n{current_extracted}")
+                        gathered_info.append(f"[SOURCE_URL: {current_page['url']}]\n{current_extracted}")
                     hop += 1
                     continue
                 else:
@@ -986,13 +962,12 @@ class ResearchAgent:
                         follow_url = current_page["links"][link_idx]["url"]
                         print(f"[{step_label + 1}/8] Following link: {follow_url}")
                         current_page = self.browser.fetch_page(follow_url)
-                        self._url_segments[current_page["url"]] = current_page.get("segments", [])
+                        self._url_segments[current_page["url"]] = (current_page.get("text", ""), current_page.get("segments", []))
                         raw_chars = len(current_page["text"])
-                        current_extracted, offsets = self._extract_relevant(query, current_page["text"], current_page["url"])
+                        current_extracted = self._extract_relevant(query, current_page["text"], current_page["url"])
                         print(f"      Retrieved {raw_chars} chars raw, extracted {len(current_extracted)} chars relevant")
                         if current_extracted:
-                            offset_str = ",".join(str(o) for o in offsets) if offsets else ""
-                            gathered_info.append(f"[SOURCE_URL: {current_page['url']}]\n[CHAR_OFFSETS: {offset_str}]\n{current_extracted}")
+                            gathered_info.append(f"[SOURCE_URL: {current_page['url']}]\n{current_extracted}")
                         hop += 1
                         continue
                 except (ValueError, IndexError):
@@ -1021,8 +996,8 @@ class ResearchAgent:
                 "- days: which days of the week it runs (e.g. 'Thursday', 'Friday, Saturday')\n"
                 "- time: the hours it is active (e.g. '22:00-00:00', '17:30-close', 'all day')\n"
                 "- source_url: the EXACT URL shown in [SOURCE_URL: ...] above the content where this promotion appeared\n"
-                "- source_char_offset: (optional integer) pick the most relevant number from [CHAR_OFFSETS: ...]\n"
-                "  in the section where you found this promotion; omit if no offsets listed\n\n"
+                "- source_text_anchor: a verbatim 20-30 character snippet copied EXACTLY from the page text\n"
+                "  near where this promotion appears; used to locate the element for screenshotting\n\n"
                 "IMPORTANT: For source_url, copy the URL exactly from [SOURCE_URL: <url>] tags in the research. "
                 "Do not invent URLs. Reply with ONLY the JSON array, no explanation."
             )
