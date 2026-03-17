@@ -493,10 +493,10 @@ class BrowserTool:
         page.screenshot(path=out_path, clip=clip)
         return out_path
 
-    def _screenshot_promo_all_levels(self, page, url, promo_index, char_offset, segments):
+    def _screenshot_promo_all_levels(self, page, url, promo_index, char_offset, segments, out_dir=None):
         from pathlib import Path
         slug = re.sub(r"[^a-zA-Z0-9]", "_", url)[:60].strip("_")
-        base = Path(self.screenshot_dir)
+        base = Path(out_dir or self.screenshot_dir)
 
         def fallback():
             out = str(base / f"{slug}_{promo_index}_lv0.png")
@@ -885,6 +885,42 @@ class ResearchAgent:
 
         return json.dumps(promos, ensure_ascii=False)
 
+    def _add_rich_screenshots(self, rich_json_str: str) -> str:
+        """Post-process pub-site-mode JSON: screenshot each promotion/event using live pages."""
+        try:
+            data = json.loads(rich_json_str)
+            if not isinstance(data, dict):
+                return rich_json_str
+        except (json.JSONDecodeError, AttributeError):
+            return rich_json_str
+
+        os.makedirs("tmp", exist_ok=True)
+        live_lookup = {record["url"]: record["page"] for record in self._live_pages if "url" in record and "page" in record}
+
+        for label, items in [("deal", data.get("deals", [])), ("event", data.get("events", []))]:
+            for i, item in enumerate(items):
+                source_url = item.get("source_url", "")
+                page = live_lookup.get(source_url)
+                if not page:
+                    continue
+                page_text, segments = self._url_segments.get(source_url, ("", []))
+                extract_string = item.get("extract_string", "")
+                char_offset = page_text.find(extract_string) if extract_string else -1
+                if char_offset < 0:
+                    char_offset = None
+                try:
+                    primary, all_paths = self.browser._screenshot_promo_all_levels(
+                        page, source_url, f"{label}_{i}", char_offset, segments, out_dir="tmp"
+                    )
+                    if primary:
+                        item["screenshot_path"] = primary
+                        item["screenshot_all_levels"] = all_paths
+                        print(f"  [screenshot] {label}_{i}: {primary} ({len(all_paths)} levels)")
+                except Exception as e:
+                    print(f"  [screenshot] {label}_{i} failed: {e}")
+
+        return json.dumps(data, ensure_ascii=False)
+
     def _find_pub_home_url(self, pub_name: str, pub_address: str, query: str) -> str | None:
         """Single search to find a pub's official website URL."""
         search_query = f'"{pub_name}" pub website {pub_address}'
@@ -972,8 +1008,8 @@ class ResearchAgent:
     def _build_rich_extraction_prompt(self, query: str, combined_text: str) -> tuple[str, str]:
         """Build (system, user) prompt for rich pub data extraction."""
         schema_example = {
-            "promotions": [{"title": "", "description": "", "discount": "", "days": "", "time": "", "source_url": "", "extract_string": ""}],
-            "events": [{"title": "", "description": "", "date": "", "time": "", "source_url": "", "extract_string": ""}],
+            "deals": [{"title": "", "description": "", "category": "", "day": "", "time": "", "source_url": "", "extract_string": ""}],
+            "events": [{"title": "", "description": "", "category": "", "day": "", "time": "", "source_url": "", "extract_string": ""}],
             "opening_times": {"monday": "", "tuesday": "", "wednesday": "", "thursday": "", "friday": "", "saturday": "", "sunday": "", "source_url": ""},
             "description": {"text": "", "source_url": ""},
             "facilities": [{"name": "", "source_url": ""}],
@@ -991,16 +1027,17 @@ class ResearchAgent:
             "Extract structured pub information and return a JSON object matching this schema exactly:\n"
             f"{json.dumps(schema_example, indent=2)}\n\n"
             "Field guidance:\n"
-            "- promotions[]: recurring deals, happy hours, drink specials, discount offers\n"
+            "- deals[]: discounts, drink specials, happy hours, recurring price offers (NOT events)\n"
             "  - title: short name for the deal\n"
             "  - description: full detail of what the deal is\n"
-            "  - discount: price or saving (e.g. '£6', '50% off', 'variable')\n"
-            "  - days: which days it runs (e.g. 'Thursday', 'Monday–Friday')\n"
+            "  - category: one of: '2-for-1', 'happy hour', 'meal deal', 'drink special', 'free item', 'discount', 'loyalty offer'\n"
+            "  - day: which days it runs (e.g. 'Thursday', 'Monday–Friday', 'Daily')\n"
             "  - time: hours active (e.g. '17:00–19:00', 'all day')\n"
-            "- events[]: one-off or recurring events (quiz nights, live music, themed nights)\n"
+            "- events[]: things happening at the pub — quiz nights, live music, themed nights, sport screenings\n"
             "  - title: event name\n"
             "  - description: what happens at the event\n"
-            "  - date: date or recurrence pattern (e.g. 'Every Thursday', '14 June 2025')\n"
+            "  - category: one of: 'quiz night', 'live music', 'karaoke', 'comedy night', 'DJ set', 'open mic', 'sports screening', 'themed night', 'bingo', 'games night'\n"
+            "  - day: date or recurrence pattern (e.g. 'Every Thursday', '14 June 2025')\n"
             "  - time: start time\n"
             "- opening_times: hours for each day (e.g. '12:00–23:00'), empty string if unknown\n"
             "- description.text: 1–2 sentence pub description covering vibe, style, what makes it special\n"
@@ -1010,7 +1047,10 @@ class ResearchAgent:
             f"  {emoji_options}\n\n"
             "IMPORTANT RULES:\n"
             "1. source_url: copy EXACTLY from the nearest === SOURCE: <url> === header above the item\n"
-            "2. extract_string: a verbatim 10-20 character snippet from the page text near the item\n"
+            "2. extract_string: a verbatim snippet copied EXACTLY from the page text that UNIQUELY identifies\n"
+            "   where on the page this item appears — used to locate the precise DOM element for screenshotting.\n"
+            "   Must be at least 20 characters. Prefer 25–40 characters. Must appear verbatim in the source text.\n"
+            "   Include enough surrounding context (e.g. title + price, or title + day) to be unique on the page.\n"
             "3. Use [] for list fields with no data found, {} for object fields, empty string if unknown\n"
             "4. Reply with ONLY valid JSON — no markdown fences, no explanation"
         )
@@ -1027,7 +1067,7 @@ class ResearchAgent:
             home_url = self._find_pub_home_url(pub_name or query, pub_address or "", query)
             if not home_url:
                 print("  [pub_site] Could not find pub website")
-                return json.dumps({"promotions": [], "events": [], "opening_times": {}, "description": {}, "facilities": []})
+                return json.dumps({"deals": [], "events": [], "opening_times": {}, "description": {}, "facilities": []})
             print(f"  [pub_site] Found home URL: {home_url}")
 
         combined_text, live_pages = self._crawl_pub_site(home_url, pub_name or "", pub_address or "")
@@ -1036,8 +1076,8 @@ class ResearchAgent:
         system, user = self._build_rich_extraction_prompt(query, combined_text)
 
         rich_schema = {
-            "promotions": [{"title": "", "description": "", "discount": "", "days": "", "time": "", "source_url": "", "extract_string": ""}],
-            "events": [{"title": "", "description": "", "date": "", "time": "", "source_url": "", "extract_string": ""}],
+            "deals": [{"title": "", "description": "", "category": "", "day": "", "time": "", "source_url": "", "extract_string": ""}],
+            "events": [{"title": "", "description": "", "category": "", "day": "", "time": "", "source_url": "", "extract_string": ""}],
             "opening_times": {"monday": "", "tuesday": "", "wednesday": "", "thursday": "", "friday": "", "saturday": "", "sunday": "", "source_url": ""},
             "description": {"text": "", "source_url": ""},
             "facilities": [{"name": "", "source_url": ""}],
@@ -1067,18 +1107,18 @@ class ResearchAgent:
             if _JSONSCHEMA_AVAILABLE:
                 try:
                     jsonschema.validate(json.loads(clean), coerced)
-                    return clean
+                    return self._add_rich_screenshots(clean)
                 except (json.JSONDecodeError, jsonschema.ValidationError) as e:
                     if attempt < 2:
                         user_prompt = user + f"\n\nPrevious attempt failed: {e}\nReturn ONLY valid JSON."
             else:
                 try:
                     json.loads(clean)
-                    return clean
+                    return self._add_rich_screenshots(clean)
                 except json.JSONDecodeError as e:
                     if attempt < 2:
                         user_prompt = user + f"\n\nPrevious attempt failed: {e}\nReturn ONLY valid JSON."
-        return last_response  # graceful fallback
+        return self._add_rich_screenshots(last_response)  # graceful fallback
 
     def run(self, query: str, start_url: str | None = None,
             pub_name: str | None = None, pub_address: str | None = None,
