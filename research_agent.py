@@ -11,6 +11,7 @@ Requires: pip install -r requirements.txt && playwright install chromium
 """
 
 import argparse
+import asyncio
 import json
 import os
 import re
@@ -443,6 +444,63 @@ class BrowserTool:
             except Exception:
                 pass
         self._pw = self._browser = self._context = None
+
+    async def _fetch_subpages_async(self, urls: list[str]) -> list[dict]:
+        """Fetch multiple sub-pages concurrently using async Playwright (JS-rendered).
+        Returns list of {url, text, segments} dicts. Pages are closed after extraction."""
+        from playwright.async_api import async_playwright
+
+        async def _dismiss_popups_async(page) -> None:
+            try:
+                await page.evaluate("""() => {
+                    const keywords = ['accept', 'agree', 'got it', 'ok', 'close', 'dismiss', 'reject all', 'continue'];
+                    for (const el of document.querySelectorAll('button, a[role="button"]')) {
+                        const t = el.textContent.trim().toLowerCase();
+                        if (keywords.some(k => t === k || t.startsWith(k))) { el.click(); break; }
+                    }
+                }""")
+                await page.wait_for_timeout(400)
+            except Exception:
+                pass
+
+        async def fetch_one(context, url: str) -> dict:
+            page = await context.new_page()
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=NETWORKIDLE_TIMEOUT)
+                except Exception:
+                    pass
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await _dismiss_popups_async(page)
+                await page.wait_for_timeout(SCROLL_DELAY)
+                html = await page.content()
+                text = _extract_text(html)
+                return {"url": page.url, "text": text, "segments": []}
+            except Exception as e:
+                return {"url": url, "text": f"Error fetching page: {e}", "segments": []}
+            finally:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            try:
+                context = await browser.new_context(
+                    user_agent=self._USER_AGENT,
+                    viewport={"width": 390, "height": 844},
+                    is_mobile=True,
+                    device_scale_factor=3,
+                )
+                try:
+                    results = await asyncio.gather(*[fetch_one(context, url) for url in urls])
+                    return list(results)
+                finally:
+                    await context.close()
+            finally:
+                await browser.close()
 
     def __enter__(self):
         self.start()
@@ -1038,31 +1096,37 @@ class ResearchAgent:
             if self._cache:
                 self._cache.set_subpages(home_data["url"], top_links)
 
-        # ── Sub-pages in parallel via HTTP (Playwright sync API is not thread-safe) ──
+        # ── Sub-pages in parallel via async Playwright (JS-rendered, concurrent) ──
         if top_links:
             t2 = _time.time()
-            print(f"  [crawl] Loading {len(top_links)} sub-pages in parallel (HTTP): {top_links}")
+            print(f"  [crawl] Loading {len(top_links)} sub-pages in parallel (async Playwright): {top_links}")
 
-            def _fetch_sub_http(url: str) -> dict:
-                text = self.browser._try_http_fetch(url)
-                return {"url": url, "text": text or "", "segments": []}
+            # asyncio.run() fails if a loop is already running (Playwright sync keeps one).
+            # Run the coroutine in a dedicated thread with its own fresh event loop.
+            def _run_async_in_thread(coro):
+                loop = asyncio.new_event_loop()
+                try:
+                    return loop.run_until_complete(coro)
+                finally:
+                    loop.close()
 
-            results: dict[str, dict] = {}
-            with ThreadPoolExecutor(max_workers=len(top_links)) as executor:
-                futures = {executor.submit(_fetch_sub_http, url): url for url in top_links}
-                for future in as_completed(futures):
-                    sub_data = future.result()
-                    results[sub_data["url"]] = sub_data
+            with ThreadPoolExecutor(max_workers=1) as _ex:
+                sub_results = _ex.submit(
+                    _run_async_in_thread, self.browser._fetch_subpages_async(top_links)
+                ).result()
 
-            # Preserve top_links order; pages opened lazily for screenshots later
+            # Preserve top_links order; live pages opened lazily for screenshots
+            result_by_url = {r["url"]: r for r in sub_results}
             for url in top_links:
-                sub_data = results.get(url, {"url": url, "text": "", "segments": []})
-                if sub_data["text"]:
+                sub_data = result_by_url.get(url) or next(
+                    (r for r in sub_results if r["url"].rstrip("/") == url.rstrip("/")), None
+                ) or {"url": url, "text": "", "segments": []}
+                if sub_data["text"] and not sub_data["text"].startswith("Error"):
                     self._url_segments[sub_data["url"]] = (sub_data["text"], sub_data["segments"])
                     page_texts.append((sub_data["url"], sub_data["text"]))
 
             t3 = _time.time()
-            print(f"  [timing] {len(top_links)} sub-pages parallel HTTP: {t3 - t2:.1f}s  (total crawl: {t3 - t0:.1f}s)")
+            print(f"  [timing] {len(top_links)} sub-pages parallel async: {t3 - t2:.1f}s  (total crawl: {t3 - t0:.1f}s)")
 
         parts = [
             f"=== SOURCE: {url} ===\n{text[:MAX_SUBPAGE_CHARS]}"
