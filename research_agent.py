@@ -958,6 +958,14 @@ class ResearchAgent:
             for i, item in enumerate(items):
                 source_url = item.get("source_url", "")
                 page = live_lookup.get(source_url)
+                if not page and source_url:
+                    # Sub-pages were fetched via HTTP for speed; open with Playwright now for screenshot
+                    print(f"  [screenshot] opening page for screenshot: {source_url}")
+                    sub_data = self.browser.fetch_page_live(source_url)
+                    page = sub_data.get("page")
+                    if page:
+                        live_lookup[source_url] = page
+                        self._live_pages.append({"url": source_url, "page": page, "segments": sub_data.get("segments", [])})
                 if not page:
                     continue
                 extract_string = item.get("extract_string", "")
@@ -1030,35 +1038,31 @@ class ResearchAgent:
             if self._cache:
                 self._cache.set_subpages(home_data["url"], top_links)
 
-        # ── Sub-pages in parallel ──
+        # ── Sub-pages in parallel via HTTP (Playwright sync API is not thread-safe) ──
         if top_links:
             t2 = _time.time()
-            print(f"  [crawl] Loading {len(top_links)} sub-pages in parallel: {top_links}")
+            print(f"  [crawl] Loading {len(top_links)} sub-pages in parallel (HTTP): {top_links}")
 
-            def _fetch_sub(url: str) -> tuple[str, dict]:
-                return url, self.browser.fetch_page_live(url)
+            def _fetch_sub_http(url: str) -> dict:
+                text = self.browser._try_http_fetch(url)
+                return {"url": url, "text": text or "", "segments": []}
 
             results: dict[str, dict] = {}
             with ThreadPoolExecutor(max_workers=len(top_links)) as executor:
-                futures = {executor.submit(_fetch_sub, url): url for url in top_links}
+                futures = {executor.submit(_fetch_sub_http, url): url for url in top_links}
                 for future in as_completed(futures):
-                    url, sub_data = future.result()
-                    results[url] = sub_data
+                    sub_data = future.result()
+                    results[sub_data["url"]] = sub_data
 
-            # Preserve top_links order
+            # Preserve top_links order; pages opened lazily for screenshots later
             for url in top_links:
-                sub_data = results[url]
-                self._url_segments[sub_data["url"]] = (sub_data["text"], sub_data["segments"])
-                page_texts.append((sub_data["url"], sub_data["text"]))
-                if sub_data.get("page"):
-                    self._live_pages.append({
-                        "url": sub_data["url"],
-                        "page": sub_data["page"],
-                        "segments": sub_data["segments"],
-                    })
+                sub_data = results.get(url, {"url": url, "text": "", "segments": []})
+                if sub_data["text"]:
+                    self._url_segments[sub_data["url"]] = (sub_data["text"], sub_data["segments"])
+                    page_texts.append((sub_data["url"], sub_data["text"]))
 
             t3 = _time.time()
-            print(f"  [timing] {len(top_links)} sub-pages parallel: {t3 - t2:.1f}s  (total crawl: {t3 - t0:.1f}s)")
+            print(f"  [timing] {len(top_links)} sub-pages parallel HTTP: {t3 - t2:.1f}s  (total crawl: {t3 - t0:.1f}s)")
 
         parts = [
             f"=== SOURCE: {url} ===\n{text[:MAX_SUBPAGE_CHARS]}"
