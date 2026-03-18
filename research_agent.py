@@ -609,7 +609,8 @@ class BrowserTool:
         page.screenshot(path=out_path, clip=clip)
         return out_path
 
-    def _screenshot_element(self, page, url: str, promo_index, extract_string: str, out_dir=None) -> tuple[str, list[str]]:
+    def _screenshot_element(self, page, url: str, promo_index, extract_string: str, out_dir=None, aspect_ratio: float = 1.5) -> tuple[str, list[str], int]:
+        """aspect_ratio = clip_height / clip_width (default 1.5 = 3h:2w phone ratio)."""
         """Full-width screenshot clipped to the element containing extract_string."""
         from pathlib import Path
         slug = re.sub(r"[^a-zA-Z0-9]", "_", url)[:60].strip("_")
@@ -622,7 +623,7 @@ class BrowserTool:
                 page.screenshot(path=out, full_page=False)
             except Exception:
                 pass
-            return (out, [out])
+            return (out, [out], 0)
 
         if not extract_string:
             return fallback()
@@ -671,6 +672,10 @@ class BrowserTool:
         except Exception:
             pass  # use original bbox
 
+        element_height = int(bbox["height"])
+        MIN_HEIGHT_BUFFER = 24
+        min_height = element_height + MIN_HEIGHT_BUFFER
+
         self._dismiss_popups(page)
 
         # Inject a <mark> directly into the text node for true inline highlighting
@@ -702,15 +707,21 @@ class BrowserTool:
         except Exception:
             pass
 
+        vh = page.viewport_size["height"]
+        clip_w = float(vw)
+        clip_h = min(clip_w * aspect_ratio, float(vh))
+        el_center_y = bbox["y"] + bbox["height"] / 2
+        clip_y = el_center_y - clip_h / 2
+        clip_y = max(0.0, min(clip_y, vh - clip_h))
         clip = {
             "x": 0,
-            "y": max(0.0, bbox["y"] - 8),
-            "width": float(vw),
-            "height": min(bbox["height"] + 16, page.viewport_size["height"]),
+            "y": clip_y,
+            "width": clip_w,
+            "height": clip_h,
         }
         try:
             page.screenshot(path=out, clip=clip)
-            return (out, [out])
+            return (out, [out], min_height)
         except Exception:
             return fallback()
         finally:
@@ -1117,12 +1128,14 @@ class ResearchAgent:
                 extract_string = item.get("extract_string", "")
                 print(f"  [screenshot] {label}_{i}: extract_string={repr(extract_string[:40]) if extract_string else 'NONE'}")
                 try:
-                    primary, all_paths = self.browser._screenshot_element(
+                    primary, all_paths, min_height = self.browser._screenshot_element(
                         page, source_url, f"{label}_{i}", extract_string, out_dir=ss_dir
                     )
                     if primary:
                         item["screenshot_path"] = primary
                         item["screenshot_all_levels"] = all_paths
+                        if min_height:
+                            item["screenshot_min_height"] = min_height
                         print(f"  [screenshot] {label}_{i}: saved {primary}")
                 except Exception as e:
                     print(f"  [screenshot] {label}_{i} failed: {e}")
