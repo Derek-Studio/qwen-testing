@@ -411,10 +411,32 @@ class BrowserTool:
         """Click common cookie/popup dismiss buttons."""
         try:
             page.evaluate("""() => {
-                const keywords = ['accept', 'agree', 'got it', 'ok', 'close', 'dismiss', 'reject all', 'continue'];
-                for (const el of document.querySelectorAll('button, a[role="button"]')) {
+                // 1. Known cookie platform IDs first (most reliable)
+                const ids = [
+                    'onetrust-accept-btn-handler',
+                    'CybotCookiebotDialogBodyButtonAccept',
+                    'cookie-accept', 'accept-cookies', 'accept-all-cookies',
+                    'cookieAccept', 'cookieConsent', 'gdpr-accept',
+                ];
+                for (const id of ids) {
+                    const el = document.getElementById(id);
+                    if (el) { el.click(); return; }
+                }
+                // 2. Keyword match on all clickable elements
+                const keywords = [
+                    'accept all', 'accept cookies', 'allow all', 'allow cookies',
+                    'i accept', 'i agree', 'agree to all',
+                    'accept', 'agree', 'got it', 'ok', 'close', 'dismiss',
+                    'reject all', 'decline all', 'continue',
+                ];
+                const els = document.querySelectorAll(
+                    'button, a[role="button"], [class*="cookie"] button, ' +
+                    '[class*="consent"] button, [id*="cookie"] button, ' +
+                    '[id*="consent"] button, [class*="banner"] button'
+                );
+                for (const el of els) {
                     const t = el.textContent.trim().toLowerCase();
-                    if (keywords.some(k => t === k || t.startsWith(k))) { el.click(); break; }
+                    if (keywords.some(k => t === k || t.startsWith(k))) { el.click(); return; }
                 }
             }""")
             page.wait_for_timeout(400)
@@ -453,10 +475,30 @@ class BrowserTool:
         async def _dismiss_popups_async(page) -> None:
             try:
                 await page.evaluate("""() => {
-                    const keywords = ['accept', 'agree', 'got it', 'ok', 'close', 'dismiss', 'reject all', 'continue'];
-                    for (const el of document.querySelectorAll('button, a[role="button"]')) {
+                    const ids = [
+                        'onetrust-accept-btn-handler',
+                        'CybotCookiebotDialogBodyButtonAccept',
+                        'cookie-accept', 'accept-cookies', 'accept-all-cookies',
+                        'cookieAccept', 'cookieConsent', 'gdpr-accept',
+                    ];
+                    for (const id of ids) {
+                        const el = document.getElementById(id);
+                        if (el) { el.click(); return; }
+                    }
+                    const keywords = [
+                        'accept all', 'accept cookies', 'allow all', 'allow cookies',
+                        'i accept', 'i agree', 'agree to all',
+                        'accept', 'agree', 'got it', 'ok', 'close', 'dismiss',
+                        'reject all', 'decline all', 'continue',
+                    ];
+                    const els = document.querySelectorAll(
+                        'button, a[role="button"], [class*="cookie"] button, ' +
+                        '[class*="consent"] button, [id*="cookie"] button, ' +
+                        '[id*="consent"] button, [class*="banner"] button'
+                    );
+                    for (const el of els) {
                         const t = el.textContent.trim().toLowerCase();
-                        if (keywords.some(k => t === k || t.startsWith(k))) { el.click(); break; }
+                        if (keywords.some(k => t === k || t.startsWith(k))) { el.click(); return; }
                     }
                 }""")
                 await page.wait_for_timeout(400)
@@ -576,6 +618,7 @@ class BrowserTool:
 
         def fallback():
             try:
+                self._dismiss_popups(page)
                 page.screenshot(path=out, full_page=False)
             except Exception:
                 pass
@@ -627,6 +670,8 @@ class BrowserTool:
             }""", el.element_handle()) or bbox
         except Exception:
             pass  # use original bbox
+
+        self._dismiss_popups(page)
 
         clip = {
             "x": 0,
@@ -1009,7 +1054,8 @@ class ResearchAgent:
             data["social_media"] = social_links
             print(f"  [social] found {len(social_links)} link(s): {[s['platform'] for s in social_links]}")
 
-        os.makedirs("tmp", exist_ok=True)
+        ss_dir = self.browser.screenshot_dir or "tmp"
+        os.makedirs(ss_dir, exist_ok=True)
         live_lookup = {record["url"]: record["page"] for record in self._live_pages if "url" in record and "page" in record}
 
         for label, items in [("deal", data.get("deals", [])), ("event", data.get("events", []))]:
@@ -1030,7 +1076,7 @@ class ResearchAgent:
                 print(f"  [screenshot] {label}_{i}: extract_string={repr(extract_string[:40]) if extract_string else 'NONE'}")
                 try:
                     primary, all_paths = self.browser._screenshot_element(
-                        page, source_url, f"{label}_{i}", extract_string, out_dir="tmp"
+                        page, source_url, f"{label}_{i}", extract_string, out_dir=ss_dir
                     )
                     if primary:
                         item["screenshot_path"] = primary
