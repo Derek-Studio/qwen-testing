@@ -673,14 +673,32 @@ class BrowserTool:
 
         self._dismiss_popups(page)
 
-        # Highlight the matched element with a yellow background before screenshotting
+        # Inject a <mark> directly into the text node for true inline highlighting
         try:
-            page.evaluate("""(el) => {
-                el.__prevBg = el.style.backgroundColor;
-                el.__prevOutline = el.style.outline;
-                el.style.backgroundColor = '#fff176';
-                el.style.outline = '2px solid #f9a825';
-            }""", el.element_handle())
+            page.evaluate("""(snippet) => {
+                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                let node;
+                for (const len of [40, 30, 20, 15, 10]) {
+                    const short = snippet.substring(0, len);
+                    const tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                    while (node = tw.nextNode()) {
+                        const idx = node.textContent.indexOf(short);
+                        if (idx === -1) continue;
+                        const end = Math.min(idx + snippet.length, node.textContent.length);
+                        try {
+                            const range = document.createRange();
+                            range.setStart(node, idx);
+                            range.setEnd(node, end);
+                            const mark = document.createElement('mark');
+                            mark.setAttribute('data-cc-hl', '1');
+                            mark.style.cssText = 'background-color:#ffff00 !important;color:inherit !important;padding:1px 0;border-radius:2px;';
+                            mark.appendChild(range.extractContents());
+                            range.insertNode(mark);
+                        } catch(e) {}
+                        return;
+                    }
+                }
+            }""", extract_string)
         except Exception:
             pass
 
@@ -696,12 +714,16 @@ class BrowserTool:
         except Exception:
             return fallback()
         finally:
-            # Remove highlight regardless of success/failure
+            # Unwrap all injected <mark> elements
             try:
-                page.evaluate("""(el) => {
-                    el.style.backgroundColor = el.__prevBg || '';
-                    el.style.outline = el.__prevOutline || '';
-                }""", el.element_handle())
+                page.evaluate("""() => {
+                    document.querySelectorAll('mark[data-cc-hl]').forEach(mark => {
+                        const parent = mark.parentNode;
+                        while (mark.firstChild) parent.insertBefore(mark.firstChild, mark);
+                        parent.removeChild(mark);
+                        parent.normalize();
+                    });
+                }""")
             except Exception:
                 pass
 
