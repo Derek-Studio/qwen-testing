@@ -289,7 +289,7 @@ class MiniMaxClient:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "max_tokens": 2048,
+
         }).encode()
         req = urllib.request.Request(
             MINIMAX_API_URL,
@@ -406,13 +406,29 @@ class BrowserTool:
         self._pw = self._browser = self._context = None
         self.screenshot_dir = screenshot_dir
 
+    def _dismiss_popups(self, page) -> None:
+        """Click common cookie/popup dismiss buttons."""
+        try:
+            page.evaluate("""() => {
+                const keywords = ['accept', 'agree', 'got it', 'ok', 'close', 'dismiss', 'reject all', 'continue'];
+                for (const el of document.querySelectorAll('button, a[role="button"]')) {
+                    const t = el.textContent.trim().toLowerCase();
+                    if (keywords.some(k => t === k || t.startsWith(k))) { el.click(); break; }
+                }
+            }""")
+            page.wait_for_timeout(400)
+        except Exception:
+            pass
+
     def start(self):
         from playwright.sync_api import sync_playwright
         self._pw = sync_playwright().start()
         self._browser = self._pw.chromium.launch(headless=True)
         self._context = self._browser.new_context(
-            user_agent=self._USER_AGENT,
-            viewport={"width": 1280, "height": 900},
+            user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+            viewport={"width": 390, "height": 844},
+            is_mobile=True,
+            device_scale_factor=3,
         )
 
     def close(self):
@@ -493,110 +509,78 @@ class BrowserTool:
         page.screenshot(path=out_path, clip=clip)
         return out_path
 
-    def _screenshot_promo_all_levels(self, page, url, promo_index, char_offset, segments, out_dir=None):
+    def _screenshot_element(self, page, url: str, promo_index, extract_string: str, out_dir=None) -> tuple[str, list[str]]:
+        """Full-width screenshot clipped to the element containing extract_string."""
         from pathlib import Path
         slug = re.sub(r"[^a-zA-Z0-9]", "_", url)[:60].strip("_")
         base = Path(out_dir or self.screenshot_dir)
+        out = str(base / f"{slug}_{promo_index}.png")
 
         def fallback():
-            out = str(base / f"{slug}_{promo_index}_lv0.png")
             try:
-                page.screenshot(path=out, full_page=True)
+                page.screenshot(path=out, full_page=False)
             except Exception:
                 pass
             return (out, [out])
 
-        if char_offset is None or not segments:
+        if not extract_string:
             return fallback()
 
-        # Binary search for segment containing char_offset
-        lo, hi, target_seg = 0, len(segments) - 1, None
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            seg = segments[mid]
-            if seg["end"] < char_offset:
-                lo = mid + 1
-            elif seg["start"] > char_offset:
-                hi = mid - 1
-            else:
-                target_seg = seg
-                break
-        if target_seg is None:
-            return fallback()
+        vw = page.viewport_size["width"]
 
-        # Find live DOM element at char offset (must use evaluate_handle — DOM elements can't be JSON-serialized)
-        try:
-            element = page.evaluate_handle("""({targetStart}) => {
-                const SKIP = new Set(['SCRIPT','STYLE','NAV','FOOTER','HEADER','ASIDE','NOSCRIPT']);
-                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
-                    acceptNode(node) {
-                        let el = node.parentElement;
-                        while (el) { if (SKIP.has(el.tagName)) return NodeFilter.FILTER_REJECT; el = el.parentElement; }
-                        return node.textContent.trim() ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
-                    }
-                });
-                let offset = 0, node;
-                while ((node = walker.nextNode())) {
-                    const txt = node.textContent.trim(); if (!txt) continue;
-                    if (offset <= targetStart && targetStart <= offset + txt.length)
-                        return node.parentElement;
-                    offset += txt.length + 1;
-                }
-                return null;
-            }""", {"targetStart": target_seg["start"]})
-            if element.as_element() is None:
-                element = None
-        except Exception:
-            element = None
-        if element is None:
-            return fallback()
-
-        # Walk up SCREENSHOT_LEVELS ancestors
-        try:
-            ancestor_boxes = page.evaluate(f"""(el) => {{
-                const vw = window.innerWidth, vh = window.innerHeight;
-                const results = []; let cur = el;
-                for (let i = 0; i < {SCREENSHOT_LEVELS} && cur && cur.tagName !== 'BODY'; i++) {{
-                    const r = cur.getBoundingClientRect();
-                    if (r.width > 0 && r.height > 0)
-                        results.push({{ level: i, x: r.x, y: r.y, width: r.width, height: r.height }});
-                    cur = cur.parentElement;
-                }}
-                return results;
-            }}""", element)
-        except Exception:
-            return fallback()
-        if not ancestor_boxes:
-            return fallback()
-
-        # Screenshot each level
-        vw, vh = page.viewport_size["width"], page.viewport_size["height"]
-        all_paths = []
-        successful: list[tuple[str, float, float]] = []  # (path, clip_width, clip_area)
-        for box in ancestor_boxes:
-            n = box["level"]
-            out = str(base / f"{slug}_{promo_index}_lv{n}.png")
-            x0 = max(0.0, box["x"] - SCREENSHOT_PADDING)
-            y0 = max(0.0, box["y"] - SCREENSHOT_PADDING)
-            cw = min(float(vw) - x0, box["width"]  + 2 * SCREENSHOT_PADDING)
-            ch = min(float(vh) - y0, box["height"] + 2 * SCREENSHOT_PADDING)
-            clip = {"x": x0, "y": y0, "width": cw, "height": ch}
+        # Try progressively shorter substrings to find the element
+        el = None
+        for length in [len(extract_string), 40, 25]:
+            snippet = extract_string[:length].strip()
+            if len(snippet) < 10:
+                continue
             try:
-                page.screenshot(path=out, clip=clip)
-                all_paths.append(out)
-                successful.append((out, cw, cw * ch))
-            except Exception as e:
-                print(f"      [screenshot] lv{n} failed: {e}")
+                loc = page.get_by_text(snippet, exact=False)
+                if loc.count() > 0:
+                    el = loc.first
+                    break
+            except Exception:
+                continue
 
-        if not successful:
+        if el is None:
             return fallback()
 
-        # Pick first level ≥ 80% viewport width; fall back to largest area
-        primary_path = next(
-            (p for p, cw, _ in successful if cw >= 0.8 * vw),
-            max(successful, key=lambda t: t[2])[0]
-        )
-        return (primary_path, all_paths)
+        try:
+            el.scroll_into_view_if_needed()
+            bbox = el.bounding_box()
+            if not bbox:
+                return fallback()
+        except Exception:
+            return fallback()
+
+        # Walk up DOM to find a container that spans most of the page width
+        try:
+            bbox = page.evaluate("""(el) => {
+                const vw = window.innerWidth;
+                let cur = el;
+                for (let i = 0; i < 8 && cur && cur.tagName !== 'BODY'; i++) {
+                    const r = cur.getBoundingClientRect();
+                    if (r.width >= vw * 0.7 || cur.tagName === 'SECTION' || cur.tagName === 'ARTICLE')
+                        return { x: r.x, y: r.y, width: r.width, height: r.height };
+                    cur = cur.parentElement;
+                }
+                const r = el.getBoundingClientRect();
+                return { x: r.x, y: r.y, width: r.width, height: r.height };
+            }""", el.element_handle()) or bbox
+        except Exception:
+            pass  # use original bbox
+
+        clip = {
+            "x": 0,
+            "y": max(0.0, bbox["y"] - 8),
+            "width": float(vw),
+            "height": min(bbox["height"] + 16, page.viewport_size["height"]),
+        }
+        try:
+            page.screenshot(path=out, clip=clip)
+            return (out, [out])
+        except Exception:
+            return fallback()
 
     def _build_js_segments(self, page) -> tuple[str, list[dict]]:
         try:
@@ -660,6 +644,7 @@ class BrowserTool:
             except Exception:
                 pass
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            self._dismiss_popups(page)
             page.wait_for_timeout(SCROLL_DELAY)
             js_text, segments = self._build_js_segments(page)
             html = page.content()
@@ -685,6 +670,7 @@ class BrowserTool:
             except Exception:
                 pass
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            self._dismiss_popups(page)
             page.wait_for_timeout(SCROLL_DELAY)
             js_text, segments = self._build_js_segments(page)
             html = page.content()
@@ -739,6 +725,7 @@ def debug_fetch(url: str) -> None:
             except Exception:
                 pass
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            self._dismiss_popups(page)
             page.wait_for_timeout(SCROLL_DELAY)
             pw_html = page.content()
             pw_text = _extract_text(pw_html)
@@ -866,14 +853,10 @@ class ResearchAgent:
                     page.wait_for_load_state("networkidle", timeout=NETWORKIDLE_TIMEOUT)
                 except Exception:
                     pass
-                page_text, segments = self._url_segments.get(url, ("", []))
                 for i, promo in group:
                     anchor = promo.get("source_text_anchor", "")
-                    char_offset = page_text.find(anchor) if anchor else -1
-                    if char_offset < 0:
-                        char_offset = None
-                    primary_path, all_paths = self.browser._screenshot_promo_all_levels(
-                        page, url, i, char_offset, segments
+                    primary_path, all_paths = self.browser._screenshot_element(
+                        page, url, i, anchor
                     )
                     if primary_path:
                         promos[i]["screenshot_path"] = primary_path
@@ -977,20 +960,16 @@ class ResearchAgent:
                 page = live_lookup.get(source_url)
                 if not page:
                     continue
-                page_text, segments = self._url_segments.get(source_url, ("", []))
                 extract_string = item.get("extract_string", "")
-                char_offset = self._fuzzy_find(page_text, extract_string) if extract_string else -1
-                print(f"  [fuzzy] {label}_{i}: {'matched @ {}'.format(char_offset) if char_offset >= 0 else 'NO MATCH'} | {repr(extract_string)}")
-                if char_offset < 0:
-                    char_offset = None
+                print(f"  [screenshot] {label}_{i}: extract_string={repr(extract_string[:40]) if extract_string else 'NONE'}")
                 try:
-                    primary, all_paths = self.browser._screenshot_promo_all_levels(
-                        page, source_url, f"{label}_{i}", char_offset, segments, out_dir="tmp"
+                    primary, all_paths = self.browser._screenshot_element(
+                        page, source_url, f"{label}_{i}", extract_string, out_dir="tmp"
                     )
                     if primary:
                         item["screenshot_path"] = primary
                         item["screenshot_all_levels"] = all_paths
-                        print(f"  [screenshot] {label}_{i}: {primary} ({len(all_paths)} levels)")
+                        print(f"  [screenshot] {label}_{i}: saved {primary}")
                 except Exception as e:
                     print(f"  [screenshot] {label}_{i} failed: {e}")
 
@@ -1014,8 +993,15 @@ class ResearchAgent:
 
     def _crawl_pub_site(self, home_url: str, pub_name: str, pub_address: str) -> tuple[str, list[dict]]:
         """Load home page + top scored sub-pages. Returns (combined_text, live_page_records)."""
+        import time as _time
+        t0 = _time.time()
+
+        # ── Home page (must be sequential — need links to score sub-pages) ──
         print(f"  [crawl] Loading home: {home_url}")
         home_data = self.browser.fetch_page_live(home_url)
+        t1 = _time.time()
+        print(f"  [timing] home: {t1 - t0:.1f}s")
+
         self._url_segments[home_data["url"]] = (home_data["text"], home_data["segments"])
         page_texts = [(home_data["url"], home_data["text"])]
         if home_data.get("page"):
@@ -1044,17 +1030,35 @@ class ResearchAgent:
             if self._cache:
                 self._cache.set_subpages(home_data["url"], top_links)
 
-        for sub_url in top_links:
-            print(f"  [crawl] Loading sub-page: {sub_url}")
-            sub_data = self.browser.fetch_page_live(sub_url)
-            self._url_segments[sub_data["url"]] = (sub_data["text"], sub_data["segments"])
-            page_texts.append((sub_data["url"], sub_data["text"]))
-            if sub_data.get("page"):
-                self._live_pages.append({
-                    "url": sub_data["url"],
-                    "page": sub_data["page"],
-                    "segments": sub_data["segments"],
-                })
+        # ── Sub-pages in parallel ──
+        if top_links:
+            t2 = _time.time()
+            print(f"  [crawl] Loading {len(top_links)} sub-pages in parallel: {top_links}")
+
+            def _fetch_sub(url: str) -> tuple[str, dict]:
+                return url, self.browser.fetch_page_live(url)
+
+            results: dict[str, dict] = {}
+            with ThreadPoolExecutor(max_workers=len(top_links)) as executor:
+                futures = {executor.submit(_fetch_sub, url): url for url in top_links}
+                for future in as_completed(futures):
+                    url, sub_data = future.result()
+                    results[url] = sub_data
+
+            # Preserve top_links order
+            for url in top_links:
+                sub_data = results[url]
+                self._url_segments[sub_data["url"]] = (sub_data["text"], sub_data["segments"])
+                page_texts.append((sub_data["url"], sub_data["text"]))
+                if sub_data.get("page"):
+                    self._live_pages.append({
+                        "url": sub_data["url"],
+                        "page": sub_data["page"],
+                        "segments": sub_data["segments"],
+                    })
+
+            t3 = _time.time()
+            print(f"  [timing] {len(top_links)} sub-pages parallel: {t3 - t2:.1f}s  (total crawl: {t3 - t0:.1f}s)")
 
         parts = [
             f"=== SOURCE: {url} ===\n{text[:MAX_SUBPAGE_CHARS]}"
@@ -1116,7 +1120,16 @@ class ResearchAgent:
             "   Copy from the most DETAILED section of the page (the full description block), NOT from summary\n"
             "   lists or repeated compact listings. Preserve the exact word order as it appears in the text.\n"
             "3. Use [] for list fields with no data found, {} for object fields, empty string if unknown\n"
-            "4. Reply with ONLY valid JSON — no markdown fences, no explanation"
+            "4. schedule.recurring MUST be a boolean (true or false), NOT a string\n"
+            "5. Reply with ONLY valid JSON — no markdown fences, no explanation\n\n"
+            "Example of a correct response:\n"
+            '{"pub_emoji":"🍻","description":{"text":"A proper local pub with a courtyard and well-cooked British classics.","source_url":"https://example.com/"},'
+            '"deals":[{"title":"Quiz Night","description":"Weekly pub quiz with great prizes.","category":"quiz night","schedule":{"recurring":true,"days":["thursday"],"date":"","time_open":"19:30","time_close":""},"source_url":"https://example.com/events/","extract_string":"Every Thursday at 7.30pm Quiz Night"}],'
+            '"events":[{"title":"Open Mic Night","description":"Live performances by local artists.","category":"open mic","schedule":{"recurring":true,"days":["monday"],"date":"","time_open":"19:00","time_close":""},"source_url":"https://example.com/events/","extract_string":"Every Monday at 7pm Open Mic Night"}],'
+            '"opening_times":[{"day":"monday","open":"12:00","close":"23:00"},{"day":"tuesday","open":"12:00","close":"23:00"},{"day":"wednesday","open":"12:00","close":"23:00"},{"day":"thursday","open":"12:00","close":"23:00"},{"day":"friday","open":"12:00","close":"00:00"},{"day":"saturday","open":"12:00","close":"00:00"},{"day":"sunday","open":"12:00","close":"22:30"}],'
+            '"facilities":[{"name":"Beer Garden","source_url":"https://example.com/"},{"name":"Dog Friendly","source_url":"https://example.com/"}],'
+            '"social_media":[{"platform":"instagram","url":"https://instagram.com/example","username":"example"}],'
+            '"website":"https://example.com"}'
         )
         user = f"Query: {query}\n\nPage content:\n{combined_text}"
         return system, user
@@ -1150,9 +1163,12 @@ class ResearchAgent:
         }
         coerced = _coerce_to_schema(rich_schema)
         user_prompt = user
+        import time as _time
         last_response = ""
         for attempt in range(3):
+            t_llm_start = _time.time()
             response = self.llm.chat(system, user_prompt)
+            print(f"  [timing] LLM: {_time.time() - t_llm_start:.1f}s")
             last_response = response
             clean = re.sub(r"^```(?:json)?\s*|\s*```$", "", response.strip())
             clean = re.sub(r"<think>.*?</think>\s*", "", clean, flags=re.DOTALL).strip()
@@ -1173,18 +1189,27 @@ class ResearchAgent:
             if _JSONSCHEMA_AVAILABLE:
                 try:
                     jsonschema.validate(json.loads(clean), coerced)
-                    return self._add_rich_screenshots(clean, home_url)
+                    t_ss_start = _time.time()
+                    result = self._add_rich_screenshots(clean, home_url)
+                    print(f"  [timing] screenshots: {_time.time() - t_ss_start:.1f}s")
+                    return result
                 except (json.JSONDecodeError, jsonschema.ValidationError) as e:
                     if attempt < 2:
-                        user_prompt = user + f"\n\nPrevious attempt failed: {e}\nReturn ONLY valid JSON."
+                        user_prompt = user + f"\n\nYour previous response contained invalid JSON:\n{clean}\n\nError: {e}\n\nFix the JSON and return ONLY the corrected valid JSON."
             else:
                 try:
                     json.loads(clean)
-                    return self._add_rich_screenshots(clean, home_url)
+                    t_ss_start = _time.time()
+                    result = self._add_rich_screenshots(clean, home_url)
+                    print(f"  [timing] screenshots: {_time.time() - t_ss_start:.1f}s")
+                    return result
                 except json.JSONDecodeError as e:
                     if attempt < 2:
-                        user_prompt = user + f"\n\nPrevious attempt failed: {e}\nReturn ONLY valid JSON."
-        return self._add_rich_screenshots(last_response, home_url)  # graceful fallback
+                        user_prompt = user + f"\n\nYour previous response contained invalid JSON:\n{clean}\n\nError: {e}\n\nFix the JSON and return ONLY the corrected valid JSON."
+        t_ss_start = _time.time()
+        result = self._add_rich_screenshots(last_response, home_url)  # graceful fallback
+        print(f"  [timing] screenshots: {_time.time() - t_ss_start:.1f}s")
+        return result
 
     def run(self, query: str, start_url: str | None = None,
             pub_name: str | None = None, pub_address: str | None = None,
