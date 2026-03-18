@@ -673,6 +673,17 @@ class BrowserTool:
 
         self._dismiss_popups(page)
 
+        # Highlight the matched element with a yellow background before screenshotting
+        try:
+            page.evaluate("""(el) => {
+                el.__prevBg = el.style.backgroundColor;
+                el.__prevOutline = el.style.outline;
+                el.style.backgroundColor = '#fff176';
+                el.style.outline = '2px solid #f9a825';
+            }""", el.element_handle())
+        except Exception:
+            pass
+
         clip = {
             "x": 0,
             "y": max(0.0, bbox["y"] - 8),
@@ -684,6 +695,15 @@ class BrowserTool:
             return (out, [out])
         except Exception:
             return fallback()
+        finally:
+            # Remove highlight regardless of success/failure
+            try:
+                page.evaluate("""(el) => {
+                    el.style.backgroundColor = el.__prevBg || '';
+                    el.style.outline = el.__prevOutline || '';
+                }""", el.element_handle())
+            except Exception:
+                pass
 
     def _build_js_segments(self, page) -> tuple[str, list[dict]]:
         try:
@@ -1229,10 +1249,20 @@ class ResearchAgent:
             "IMPORTANT RULES:\n"
             "1. source_url: copy EXACTLY from the nearest === SOURCE: <url> === header above the item\n"
             "2. extract_string: a verbatim snippet copied EXACTLY from the page text that UNIQUELY identifies\n"
-            "   where on the page this item appears — used to locate the precise DOM element for screenshotting.\n"
-            "   Must be at least 20 characters. Prefer 25–40 characters. Must appear verbatim in the source text.\n"
-            "   Copy from the most DETAILED section of the page (the full description block), NOT from summary\n"
-            "   lists or repeated compact listings. Preserve the exact word order as it appears in the text.\n"
+            "   the item's main content block — used to locate the precise DOM element for screenshotting.\n"
+            "   RULES:\n"
+            "   - Must be 40–80 characters. Longer is better for uniqueness.\n"
+            "   - Must appear verbatim in the source text (exact characters, exact order).\n"
+            "   - MUST be unique on the page. Many sites repeat item names in footers, nav menus, or\n"
+            "     sidebar lists — do NOT use text that could match those. Include surrounding context\n"
+            "     (date, time, price, description) to make the string unique to the content card.\n"
+            "   - ALWAYS include date/time/price when present — e.g. 'Board Games Tuesday 24th March 17:00'\n"
+            "     is far better than just 'Board Games Tuesday' which may appear in a footer.\n"
+            "   - Copy from the DETAILED description block of the item, not from compact summary lists.\n"
+            "   - BAD:  'Board Games Tuesday' (too short, appears in footer nav)\n"
+            "   - GOOD: 'Board Games Tuesday 24th March 17:00 - 22:00 Enjoy our selection of available board games'\n"
+            "   - BAD:  'Mixr Mondays' (appears in footer)\n"
+            "   - GOOD: 'Mixr Mondays Earn double points on Mondays when you use Stonegate app MiXR'\n"
             "3. Use [] for list fields with no data found, {} for object fields, empty string if unknown\n"
             "4. schedule.recurring MUST be a boolean (true or false), NOT a string\n"
             "5. Reply with ONLY valid JSON — no markdown fences, no explanation\n\n"
